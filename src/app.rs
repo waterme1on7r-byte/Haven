@@ -28,7 +28,11 @@ const RED: Color32 = Color32::from_rgb(0xd0, 0x50, 0x5e);
 const BAR_FUTURE: Color32 = Color32::from_rgb(0xe4, 0xe4, 0xe4);
 const ACCENT: Color32 = Color32::from_rgb(0xab, 0x43, 0x54); // progress ring
 const RING_TRACK: Color32 = Color32::from_rgb(0x2f, 0x30, 0x32);
-const SECS_PER_BAR: f64 = 0.05;
+// Slightly wider time bins keep the moving waveform calm at every window size.
+const SECS_PER_BAR: f64 = 0.125;
+const MENU_VIEWPORT_HEIGHT: f32 = 520.0;
+const PLAYLIST_HEIGHT: f32 = 270.0;
+const PLAYLIST_GAP: f32 = 8.0;
 
 pub struct Haven {
     engine: Engine,
@@ -40,6 +44,7 @@ pub struct Haven {
     settings: Settings,
     pos_changed: Option<Instant>,
     playlist_open: bool,
+    context_menu_open: bool,
 }
 
 fn scan(paths: &[PathBuf]) -> Vec<PathBuf> {
@@ -154,6 +159,7 @@ impl Haven {
             settings,
             pos_changed: None,
             playlist_open: false,
+            context_menu_open: false,
         }
     }
 
@@ -198,8 +204,123 @@ impl Haven {
                 .as_ref()
                 .map(|i| meta::spawn_waveform(i.path.clone())); // old Arc dropped -> old job stops
             if let Some(i) = &self.info {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("{} — Haven", i.title)));
+                // Keep the app name first so Windows' volume mixer groups the session
+                // under a recognizable Haven label when it uses the window title.
+                ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("Haven — {}", i.title)));
             }
+        }
+    }
+
+    fn show_context_menu(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        self.context_menu_open = true;
+        let sh = self.engine.shared.clone();
+        if ui.button("Previous").clicked() {
+            self.engine.prev();
+            ui.close_menu();
+        }
+        if ui.button("Next").clicked() {
+            self.engine.next();
+            ui.close_menu();
+        }
+        ui.separator();
+        if ui
+            .button(if self.playlist_open {
+                "Hide playlist"
+            } else {
+                "Playlist"
+            })
+            .clicked()
+        {
+            self.playlist_open = !self.playlist_open;
+            ui.close_menu();
+        }
+        let mut v = sh.vol();
+        if ui
+            .add(
+                egui::Slider::new(&mut v, 0.0..=1.0)
+                    .text("Volume")
+                    .show_value(false),
+            )
+            .changed()
+        {
+            sh.set_vol(v);
+        }
+        let mut m = sh.muted.load(Relaxed);
+        if ui.checkbox(&mut m, "Mute").changed() {
+            sh.muted.store(m, Relaxed);
+        }
+        let mut s = sh.shuffle.load(Relaxed);
+        if ui.checkbox(&mut s, "Shuffle").changed() {
+            sh.shuffle.store(s, Relaxed);
+        }
+        let mut rep = sh.repeat.load(Relaxed);
+        let before = rep;
+        ui.radio_value(&mut rep, 0u8, "Repeat off");
+        ui.radio_value(&mut rep, 1u8, "Repeat all");
+        ui.radio_value(&mut rep, 2u8, "Repeat one");
+        if rep != before {
+            sh.repeat.store(rep, Relaxed);
+        }
+        ui.separator();
+        ui.menu_button("Size", |ui| {
+            for (n, label) in [(0u8, "Small"), (1, "Medium"), (2, "Big")] {
+                if ui.radio(self.settings.size == n, label).clicked() {
+                    self.settings.size = n;
+                    self.settings.save();
+                    let dims = Settings::dims_for(n);
+                    let desired_height = dims[1]
+                        + if self.playlist_open {
+                            PLAYLIST_HEIGHT + PLAYLIST_GAP
+                        } else {
+                            0.0
+                        };
+                    let height = if self.context_menu_open {
+                        desired_height.max(MENU_VIEWPORT_HEIGHT)
+                    } else {
+                        desired_height
+                    };
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(vec2(dims[0], height)));
+                    ui.close_menu();
+                }
+            }
+        });
+        let mut top = self.settings.on_top;
+        if ui.checkbox(&mut top, "Always on top").changed() {
+            self.settings.on_top = top;
+            self.settings.save();
+            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(if top {
+                egui::WindowLevel::AlwaysOnTop
+            } else {
+                egui::WindowLevel::Normal
+            }));
+        }
+        let mut lock = self.settings.locked;
+        if ui.checkbox(&mut lock, "Lock position").changed() {
+            self.settings.locked = lock;
+            self.settings.save();
+        }
+        ui.separator();
+        if ui.button("Open files…").clicked() {
+            if let Some(f) = rfd::FileDialog::new()
+                .add_filter("Audio", EXTS)
+                .pick_files()
+            {
+                self.open(f, false);
+            }
+            ui.close_menu();
+        }
+        if ui.button("Open folder…").clicked() {
+            if let Some(f) = rfd::FileDialog::new().pick_folder() {
+                self.open(vec![f], false);
+            }
+            ui.close_menu();
+        }
+        if ui.button("Minimize").clicked() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            ui.close_menu();
+        }
+        if ui.button("Exit").clicked() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
 
@@ -274,12 +395,10 @@ impl Haven {
         let off = h * 0.09;
         let ring_rect = pill.expand(off);
         let ring = ring_pts(ring_rect, h * 0.17 + off);
-        // Whole window is also a fallback drag target for open space.
-        if ui
-            .interact(full, id.with("win"), Sense::drag())
-            .drag_started()
-            && !self.settings.locked
-        {
+        // The full player surface is the fallback target for both dragging and
+        // opening the menu. Later controls take precedence for their own clicks.
+        let full_resp = ui.interact(full, id.with("win"), Sense::click_and_drag());
+        if full_resp.drag_started() && !self.settings.locked {
             ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
         }
         // added before the pill's own widgets so they win where they overlap
@@ -436,6 +555,7 @@ impl Haven {
 
         // bars (centered playhead, waveform scrolls underneath)
         let posbar = pos / SECS_PER_BAR;
+        let animation_time = ctx.input(|i| i.time);
         let half = (well.width() / 2.0 / pitch).ceil() as i64 + 2;
         let c0 = posbar.floor() as i64;
         let mid = well.center().y;
@@ -454,7 +574,24 @@ impl Haven {
                 let pk = peaks.as_ref().map_or(0.0, |v| {
                     v.iter().skip(b0).take(b1 - b0).fold(0f32, |a, b| a.max(*b))
                 });
-                let bh = (bw * 2.0 + pk.powf(0.6) * maxh).min(maxh);
+                let base_height = (bw * 2.0 + pk.powf(0.6) * maxh).min(maxh);
+                // Stable pseudo-random selection keeps the song's waveform silhouette intact.
+                // Animate only a few future bars, away from the remaining-time label.
+                let hash = (i as u64)
+                    .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                    .wrapping_add(self.seen_gen.wrapping_mul(0xBF58_476D_1CE4_E5B9));
+                let over_remaining_label = x >= well.right() - 68.0;
+                let animate = x > cx && !over_remaining_label && hash % 7 == 0;
+                let phase = ((hash >> 16) % 6283) as f64 / 1000.0;
+                let swell = if animate {
+                    // Smooth sinusoidal swell: one slow cycle per 18 seconds.
+                    1.0 + 0.22
+                        * ((animation_time * std::f64::consts::TAU / 18.0 + phase).sin() * 0.5
+                            + 0.5) as f32
+                } else {
+                    1.0
+                };
+                let bh = (base_height * swell).min(maxh);
                 let col = if x < cx {
                     let fade = ((well.right() - x) / (well.width() * 0.5)).clamp(0.35, 1.0);
                     Color32::from_gray(0x5a).gamma_multiply(fade)
@@ -499,115 +636,10 @@ impl Haven {
             Stroke::NONE,
         ));
 
-        // ---- right-click transport menu on the waveform ----
-        wresp.context_menu(|ui| {
-            if ui.button("Previous").clicked() {
-                self.engine.prev();
-                ui.close_menu();
-            }
-            if ui.button("Next").clicked() {
-                self.engine.next();
-                ui.close_menu();
-            }
-            ui.separator();
-            if ui
-                .button(if self.playlist_open {
-                    "Hide playlist"
-                } else {
-                    "Playlist"
-                })
-                .clicked()
-            {
-                self.playlist_open = !self.playlist_open;
-                let dims = Settings::dims_for(self.settings.size);
-                let extra = if self.playlist_open { 270.0 } else { 0.0 };
-                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(vec2(
-                    dims[0],
-                    dims[1] + extra,
-                )));
-                ui.close_menu();
-            }
-            let mut v = sh.vol();
-            if ui
-                .add(
-                    egui::Slider::new(&mut v, 0.0..=1.0)
-                        .text("Volume")
-                        .show_value(false),
-                )
-                .changed()
-            {
-                sh.set_vol(v);
-            }
-            let mut m = sh.muted.load(Relaxed);
-            if ui.checkbox(&mut m, "Mute").changed() {
-                sh.muted.store(m, Relaxed);
-            }
-            let mut s = sh.shuffle.load(Relaxed);
-            if ui.checkbox(&mut s, "Shuffle").changed() {
-                sh.shuffle.store(s, Relaxed);
-            }
-            let mut rep = sh.repeat.load(Relaxed);
-            let before = rep;
-            ui.radio_value(&mut rep, 0u8, "Repeat off");
-            ui.radio_value(&mut rep, 1u8, "Repeat all");
-            ui.radio_value(&mut rep, 2u8, "Repeat one");
-            if rep != before {
-                sh.repeat.store(rep, Relaxed);
-            }
-            ui.separator();
-            ui.menu_button("Size", |ui| {
-                for (n, label) in [(0u8, "Small"), (1, "Medium"), (2, "Big")] {
-                    if ui.radio(self.settings.size == n, label).clicked() {
-                        self.settings.size = n;
-                        self.settings.save();
-                        let d = Settings::dims_for(n);
-                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(vec2(
-                            d[0],
-                            d[1] + if self.playlist_open { 270.0 } else { 0.0 },
-                        )));
-                        ui.close_menu();
-                    }
-                }
-            });
-            let mut top = self.settings.on_top;
-            if ui.checkbox(&mut top, "Always on top").changed() {
-                self.settings.on_top = top;
-                self.settings.save();
-                ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(if top {
-                    egui::WindowLevel::AlwaysOnTop
-                } else {
-                    egui::WindowLevel::Normal
-                }));
-            }
-            let mut lock = self.settings.locked;
-            if ui.checkbox(&mut lock, "Lock position").changed() {
-                self.settings.locked = lock;
-                self.settings.save();
-            }
-            ui.separator();
-            if ui.button("Open files…").clicked() {
-                if let Some(f) = rfd::FileDialog::new()
-                    .add_filter("Audio", EXTS)
-                    .pick_files()
-                {
-                    self.open(f, false);
-                }
-                ui.close_menu();
-            }
-            if ui.button("Open folder…").clicked() {
-                if let Some(f) = rfd::FileDialog::new().pick_folder() {
-                    self.open(vec![f], false);
-                }
-                ui.close_menu();
-            }
-            if ui.button("Minimize").clicked() {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-                ui.close_menu();
-            }
-            if ui.button("Exit").clicked() {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            }
-        });
+        full_resp.context_menu(|ui| self.show_context_menu(ui, &ctx));
+        btn.context_menu(|ui| self.show_context_menu(ui, &ctx));
+        ring_resp.context_menu(|ui| self.show_context_menu(ui, &ctx));
+        wresp.context_menu(|ui| self.show_context_menu(ui, &ctx));
 
         if near && dur > 0.0 {
             ring_resp.on_hover_text_at_pointer(format!("{} / {}", fmt_time(pos), fmt_time(dur)));
@@ -618,22 +650,47 @@ impl Haven {
             wresp.on_hover_text(i.tooltip());
         }
 
-        // A slim top-edge grip stays on top of the waveform and ring hit targets.
+        // A hover-only top-edge target presents the move hint without intercepting
+        // clicks on the progress ring. Window dragging is handled by full_resp.
         let grip = Rect::from_min_max(
             full.min,
-            pos2(full.right(), (full.top() + 12.0).min(full.bottom())),
+            pos2(full.right(), (full.top() + 44.0).min(full.bottom())),
         );
-        if ui
-            .interact(grip, id.with("top-grip"), Sense::drag())
-            .drag_started()
-            && !self.settings.locked
-        {
-            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        let grip_resp = ui.interact(grip, id.with("top-grip"), Sense::hover());
+        // The drag hint is a small Haven-styled toast at the top of the player,
+        // shown only over the dedicated grip instead of following the pointer.
+        if grip_resp.hovered() {
+            let hint =
+                Rect::from_center_size(pos2(full.center().x, full.top() + 18.0), vec2(160.0, 25.0));
+            p.rect_filled(
+                hint,
+                Rounding::same(12.0),
+                Color32::from_rgb(0x20, 0x21, 0x23),
+            );
+            p.rect_stroke(hint, Rounding::same(12.0), Stroke::new(1.0, PILL_EDGE));
+            p.text(
+                hint.center(),
+                Align2::CENTER_CENTER,
+                if self.settings.locked {
+                    "Position locked"
+                } else {
+                    "Drag to move Haven"
+                },
+                FontId::proportional(11.0),
+                Color32::from_gray(0xd2),
+            );
         }
     }
 
     fn draw_playlist(&mut self, ui: &mut egui::Ui) {
         let rect = ui.max_rect();
+        let ctx = ui.ctx().clone();
+        ui.interact(
+            rect,
+            ui.id().with("playlist-context"),
+            Sense::click_and_drag(),
+        )
+        .context_menu(|ui| self.show_context_menu(ui, &ctx));
         let painter = ui.painter().clone();
         let sh = self.engine.shared.clone();
         let queue = sh.queue_info.lock().unwrap().clone();
@@ -670,19 +727,37 @@ impl Haven {
             pos2(header.right() - 8.0, header.center().y),
             vec2(31.0, 31.0),
         );
-        let close_resp = ui.interact(close, ui.id().with("playlist-close"), Sense::click());
-        painter.circle_filled(close.center(), 15.0, Color32::from_rgb(0x18, 0x19, 0x1a));
-        painter.circle_stroke(
-            close.center(),
-            15.0,
-            Stroke::new(1.0, Color32::from_gray(0x48)),
+        let close_resp = ui
+            .interact(close, ui.id().with("playlist-close"), Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text("Close playlist");
+        close_resp.context_menu(|ui| self.show_context_menu(ui, &ctx));
+        let close_fill = if close_resp.hovered() {
+            Color32::from_rgb(0x43, 0x23, 0x2a)
+        } else {
+            Color32::from_rgb(0x18, 0x19, 0x1a)
+        };
+        let close_ink = if close_resp.hovered() {
+            RED
+        } else {
+            Color32::from_gray(0xc8)
+        };
+        painter.rect_filled(close, Rounding::same(10.0), close_fill);
+        painter.rect_stroke(close, Rounding::same(10.0), Stroke::new(1.0, PILL_EDGE));
+        let cross = 4.0;
+        painter.line_segment(
+            [
+                close.center() + vec2(-cross, -cross),
+                close.center() + vec2(cross, cross),
+            ],
+            Stroke::new(1.8, close_ink),
         );
-        painter.text(
-            close.center(),
-            Align2::CENTER_CENTER,
-            "×",
-            FontId::proportional(22.0),
-            Color32::from_gray(0xd8),
+        painter.line_segment(
+            [
+                close.center() + vec2(cross, -cross),
+                close.center() + vec2(-cross, cross),
+            ],
+            Stroke::new(1.8, close_ink),
         );
         if close_resp.clicked() {
             self.playlist_open = false;
@@ -758,6 +833,7 @@ impl Haven {
                 for (n, t) in queue.iter().enumerate() {
                     let row =
                         ui.allocate_exact_size(vec2(ui.available_width(), 32.0), Sense::click());
+                    row.1.context_menu(|ui| self.show_context_menu(ui, &ctx));
                     let active = n == idx;
                     if active {
                         ui.painter().rect_filled(
@@ -840,17 +916,55 @@ impl eframe::App for Haven {
         self.sync_track(ctx);
         self.keys(ctx);
         self.track_position(ctx);
+        let menu_was_open = self.context_menu_open;
+        self.context_menu_open = false;
         let dims = Settings::dims_for(self.settings.size);
         egui::CentralPanel::default()
             .frame(egui::Frame::none())
             .show(ctx, |ui| {
-                ui.allocate_ui(vec2(dims[0], dims[1]), |ui| self.draw(ui));
+                let opacity = if ctx.input(|i| i.focused) { 1.0 } else { 0.5 };
+                ui.set_opacity(opacity);
+                // Use fixed viewport-relative rectangles so a resize cannot cause
+                // the playlist's layout cursor to restart over the player.
+                let area = ui.max_rect();
+                let player_rect = Rect::from_min_size(area.min, vec2(dims[0], dims[1]));
+                let mut player_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(player_rect)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                self.draw(&mut player_ui);
                 if self.playlist_open {
-                    ui.allocate_ui(vec2(dims[0], 270.0), |ui| self.draw_playlist(ui));
+                    let playlist_rect = Rect::from_min_size(
+                        pos2(area.left(), area.top() + dims[1] + PLAYLIST_GAP),
+                        vec2(dims[0], PLAYLIST_HEIGHT),
+                    );
+                    let mut playlist_ui = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(playlist_rect)
+                            .layout(egui::Layout::top_down(egui::Align::Min)),
+                    );
+                    self.draw_playlist(&mut playlist_ui);
                 }
             });
-        if self.engine.shared.playing.load(Relaxed) || self.drag.is_some() {
-            ctx.request_repaint(); // idle = zero redraws
+        if menu_was_open != self.context_menu_open {
+            let height = dims[1]
+                + if self.playlist_open {
+                    PLAYLIST_HEIGHT + PLAYLIST_GAP
+                } else {
+                    0.0
+                };
+            let height = if self.context_menu_open {
+                height.max(MENU_VIEWPORT_HEIGHT)
+            } else {
+                height
+            };
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(vec2(dims[0], height)));
+        }
+        if self.engine.shared.playing.load(Relaxed) {
+            ctx.request_repaint_after(Duration::from_millis(33)); // smoother waveform updates
+        } else if self.drag.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(30));
         }
     }
 }
