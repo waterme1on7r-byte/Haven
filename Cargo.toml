@@ -1,6 +1,6 @@
 [package]
 name = "haven"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 
 [dependencies]
@@ -22,6 +22,11 @@ description = "Minimal lossless desktop audio player"
 before-packaging-command = "cargo build --release"
 out-dir = "dist"
 icons = ["assets/haven.ico", "assets/haven.icns"]
+
+[package.metadata.packager.macos]
+# Ad-hoc signature ("-"): no Apple Developer account needed, but Apple Silicon
+# Macs refuse to run binaries that carry no signature at all.
+signing-identity = "-"
 
 [package.metadata.packager.nsis]
 installer-icon = "assets/haven.ico"
