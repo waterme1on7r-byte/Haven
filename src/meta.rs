@@ -24,29 +24,6 @@ pub struct TrackInfo {
     pub duration_ms: u64,
 }
 
-impl TrackInfo {
-    pub fn tooltip(&self) -> String {
-        let mut s = self.title.clone();
-        if !self.artist.is_empty() {
-            s += &format!(" — {}", self.artist);
-        }
-        if !self.album.is_empty() {
-            s += &format!("\n{}", self.album);
-        }
-        s += &format!("\n{}", self.codec);
-        if let Some(b) = self.bit_depth {
-            s += &format!(" {b}-bit");
-        }
-        if self.sample_rate > 0 {
-            s += &format!(" / {:.1} kHz", self.sample_rate as f32 / 1000.0);
-        }
-        if let Some(k) = self.bitrate_kbps {
-            s += &format!(" · {k} kbps");
-        }
-        s
-    }
-}
-
 pub fn read(path: &Path) -> TrackInfo {
     let mut i = TrackInfo {
         path: path.to_path_buf(),

@@ -72,6 +72,7 @@ enum Cmd {
     Next,
     Prev,
     Seek(f64),
+    Clear,
 }
 
 pub struct Engine {
@@ -111,6 +112,9 @@ impl Engine {
     }
     pub fn seek(&self, secs: f64) {
         let _ = self.tx.send(Cmd::Seek(secs.max(0.0)));
+    }
+    pub fn clear(&self) {
+        let _ = self.tx.send(Cmd::Clear);
     }
 }
 
@@ -297,6 +301,20 @@ impl Core {
                 }
             }
             Cmd::Seek(s) => self.seek(s),
+            Cmd::Clear => {
+                self.queue.clear();
+                self.reader = None;
+                self.pending.clear();
+                self.poff = 0;
+                self.flush();
+                self.sh.playing.store(false, Relaxed);
+                self.sh.pos_ms.store(0, Relaxed);
+                self.sh.dur_ms.store(0, Relaxed);
+                self.sh.current_idx.store(0, Relaxed);
+                *self.sh.info.lock().unwrap() = None;
+                self.sh.queue_info.lock().unwrap().clear();
+                self.sh.track_gen.fetch_add(1, Relaxed);
+            }
         }
     }
 

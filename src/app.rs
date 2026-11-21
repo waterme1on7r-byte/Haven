@@ -32,7 +32,8 @@ const RING_TRACK: Color32 = Color32::from_rgb(0x2f, 0x30, 0x32);
 const SECS_PER_BAR: f64 = 0.125;
 const MENU_VIEWPORT_HEIGHT: f32 = 520.0;
 const PLAYLIST_HEIGHT: f32 = 270.0;
-const PLAYLIST_GAP: f32 = 8.0;
+const PLAYLIST_GAP: f32 = 5.0;
+const HOVER_CARD_HEIGHT: f32 = 55.0;
 
 pub struct Haven {
     engine: Engine,
@@ -45,6 +46,8 @@ pub struct Haven {
     pos_changed: Option<Instant>,
     playlist_open: bool,
     context_menu_open: bool,
+    menu_unfocused_since: Option<Instant>,
+    menu_restore_pos: Option<egui::Pos2>,
 }
 
 fn scan(paths: &[PathBuf]) -> Vec<PathBuf> {
@@ -160,6 +163,8 @@ impl Haven {
             pos_changed: None,
             playlist_open: false,
             context_menu_open: false,
+            menu_unfocused_since: None,
+            menu_restore_pos: None,
         }
     }
 
@@ -395,12 +400,28 @@ impl Haven {
         let off = h * 0.09;
         let ring_rect = pill.expand(off);
         let ring = ring_pts(ring_rect, h * 0.17 + off);
-        // The full player surface is the fallback target for both dragging and
-        // opening the menu. Later controls take precedence for their own clicks.
-        let full_resp = ui.interact(full, id.with("win"), Sense::click_and_drag());
-        if full_resp.drag_started() && !self.settings.locked {
-            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        // A native window move must begin on the same mouse-down event. Starting
+        // it after egui's drag threshold is crossed is intermittent on Windows.
+        let begin_window_drag = ctx.input(|i| {
+            if i.pointer.button_pressed(egui::PointerButton::Primary) {
+                i.pointer.interact_pos()
+            } else {
+                None
+            }
+        });
+        if let Some(pt) = begin_window_drag {
+            let on_progress_ring = nearest_frac(&ring, pt).0 <= sw * 2.0;
+            if full.contains(pt)
+                && !well.contains(pt)
+                && !brect.contains(pt)
+                && !on_progress_ring
+                && !self.settings.locked
+            {
+                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+            }
         }
+        // The full player surface also owns right-clicks and the app-level hover.
+        let full_resp = ui.interact(full, id.with("win"), Sense::click());
         // added before the pill's own widgets so they win where they overlap
         let ring_resp = ui.interact(
             ring_rect.expand(sw),
@@ -409,21 +430,11 @@ impl Haven {
         );
 
         // ---- interaction ----
-        if ui
-            .interact(pill, id.with("bg"), Sense::drag())
-            .drag_started()
-            && !self.settings.locked
-        {
-            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-        }
         let btn = ui
             .interact(brect, id.with("btn"), Sense::click_and_drag())
             .on_hover_cursor(egui::CursorIcon::PointingHand);
         if btn.clicked() {
             self.engine.toggle();
-        }
-        if btn.drag_started() && !self.settings.locked {
-            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
         }
 
         let wresp = ui.interact(well, id.with("wave"), Sense::click_and_drag());
@@ -463,9 +474,6 @@ impl Haven {
             self.ring_active = ring_resp
                 .interact_pointer_pos()
                 .map_or(false, |pt| nearest_frac(&ring, pt).0 <= sw * 2.0);
-            if !self.ring_active && !self.settings.locked {
-                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag); // grabbed the gap, not the ring
-            }
         }
         if self.ring_active && ring_resp.dragged() {
             if let Some(pt) = ring_resp.interact_pointer_pos() {
@@ -641,44 +649,46 @@ impl Haven {
         ring_resp.context_menu(|ui| self.show_context_menu(ui, &ctx));
         wresp.context_menu(|ui| self.show_context_menu(ui, &ctx));
 
-        if near && dur > 0.0 {
-            ring_resp.on_hover_text_at_pointer(format!("{} / {}", fmt_time(pos), fmt_time(dur)));
-        }
-
-        // Track details live in a tooltip so the visual design stays untouched.
-        if let Some(i) = &self.info {
-            wresp.on_hover_text(i.tooltip());
-        }
-
-        // A hover-only top-edge target presents the move hint without intercepting
-        // clicks on the progress ring. Window dragging is handled by full_resp.
-        let grip = Rect::from_min_max(
-            full.min,
-            pos2(full.right(), (full.top() + 44.0).min(full.bottom())),
-        );
-        let grip_resp = ui.interact(grip, id.with("top-grip"), Sense::hover());
-        // The drag hint is a small Haven-styled toast at the top of the player,
-        // shown only over the dedicated grip instead of following the pointer.
-        if grip_resp.hovered() {
-            let hint =
-                Rect::from_center_size(pos2(full.center().x, full.top() + 18.0), vec2(160.0, 25.0));
-            p.rect_filled(
-                hint,
-                Rounding::same(12.0),
-                Color32::from_rgb(0x20, 0x21, 0x23),
-            );
-            p.rect_stroke(hint, Rounding::same(12.0), Stroke::new(1.0, PILL_EDGE));
-            p.text(
-                hint.center(),
-                Align2::CENTER_CENTER,
-                if self.settings.locked {
-                    "Position locked"
+        // Selected hover design: metadata card. It replaces egui's generic
+        // tooltips and appears only on empty player space.
+        if full_resp.hovered()
+            && !wresp.hovered()
+            && !btn.hovered()
+            && !ring_resp.hovered()
+            && !self.context_menu_open
+        {
+            if let Some(info) = &self.info {
+                let panel = Rect::from_min_max(
+                    pos2(full.left() + 14.0, full.top() + 7.0),
+                    pos2(full.right() - 14.0, full.top() + 7.0 + HOVER_CARD_HEIGHT),
+                );
+                p.rect_filled(
+                    panel,
+                    Rounding::same(13.0),
+                    Color32::from_rgb(0x20, 0x21, 0x23),
+                );
+                p.rect_stroke(panel, Rounding::same(13.0), Stroke::new(1.0, PILL_EDGE));
+                p.text(
+                    panel.left_top() + vec2(14.0, 12.0),
+                    Align2::LEFT_TOP,
+                    &info.title,
+                    FontId::proportional(12.0),
+                    Color32::from_gray(0xe7),
+                );
+                let secondary = if info.artist.is_empty() {
+                    info.codec.clone()
                 } else {
-                    "Drag to move Haven"
-                },
-                FontId::proportional(11.0),
-                Color32::from_gray(0xd2),
-            );
+                    format!("{}  ·  {}", info.artist, info.codec)
+                };
+                p.text(
+                    panel.left_bottom() + vec2(14.0, -12.0),
+                    Align2::LEFT_BOTTOM,
+                    secondary,
+                    FontId::proportional(10.0),
+                    Color32::from_gray(0x98),
+                );
+                p.circle_filled(panel.right_center() - vec2(14.0, 0.0), 4.0, RED);
+            }
         }
     }
 
@@ -723,14 +733,41 @@ impl Haven {
             FontId::proportional(12.0),
             Color32::from_gray(0x82),
         );
+        let clear = Rect::from_center_size(
+            pos2(header.right() - 51.0, header.center().y),
+            vec2(45.0, 31.0),
+        );
+        let clear_resp = ui
+            .interact(clear, ui.id().with("playlist-clear"), Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        let clear_fill = if clear_resp.hovered() {
+            Color32::from_rgb(0x43, 0x23, 0x2a)
+        } else {
+            Color32::from_rgb(0x18, 0x19, 0x1a)
+        };
+        painter.rect_filled(clear, Rounding::same(10.0), clear_fill);
+        painter.rect_stroke(clear, Rounding::same(10.0), Stroke::new(1.0, PILL_EDGE));
+        painter.text(
+            clear.center(),
+            Align2::CENTER_CENTER,
+            "Clear",
+            FontId::proportional(10.0),
+            if clear_resp.hovered() {
+                RED
+            } else {
+                Color32::from_gray(0xc8)
+            },
+        );
+        if clear_resp.clicked() {
+            self.engine.clear();
+        }
         let close = Rect::from_center_size(
             pos2(header.right() - 8.0, header.center().y),
             vec2(31.0, 31.0),
         );
         let close_resp = ui
             .interact(close, ui.id().with("playlist-close"), Sense::click())
-            .on_hover_cursor(egui::CursorIcon::PointingHand)
-            .on_hover_text("Close playlist");
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
         close_resp.context_menu(|ui| self.show_context_menu(ui, &ctx));
         let close_fill = if close_resp.hovered() {
             Color32::from_rgb(0x43, 0x23, 0x2a)
@@ -827,6 +864,7 @@ impl Haven {
                 .max_rect(list)
                 .layout(egui::Layout::top_down(egui::Align::Min)),
         );
+        child.set_clip_rect(list);
         egui::ScrollArea::vertical()
             .id_source("playlist-scroll")
             .show(&mut child, |ui| {
@@ -872,14 +910,22 @@ impl Haven {
                             Color32::from_gray(0x70)
                         },
                     );
-                    ui.painter().text(
+                    let title_clip = Rect::from_min_max(
+                        pos2(row.0.left() + 50.0, row.0.top()),
+                        pos2(row.0.left() + row.0.width() * 0.51, row.0.bottom()),
+                    );
+                    ui.painter().with_clip_rect(title_clip).text(
                         pos2(row.0.left() + 52.0, row.0.center().y),
                         Align2::LEFT_CENTER,
                         &t.title,
                         FontId::proportional(12.0),
                         fg,
                     );
-                    ui.painter().text(
+                    let artist_clip = Rect::from_min_max(
+                        pos2(row.0.left() + row.0.width() * 0.53, row.0.top()),
+                        pos2(row.0.right() - 56.0, row.0.bottom()),
+                    );
+                    ui.painter().with_clip_rect(artist_clip).text(
                         pos2(row.0.left() + row.0.width() * 0.53, row.0.center().y),
                         Align2::LEFT_CENTER,
                         &t.artist,
@@ -917,6 +963,18 @@ impl eframe::App for Haven {
         self.keys(ctx);
         self.track_position(ctx);
         let menu_was_open = self.context_menu_open;
+        if menu_was_open && !ctx.input(|i| i.focused) {
+            let since = self.menu_unfocused_since.get_or_insert_with(Instant::now);
+            if since.elapsed() >= Duration::from_secs(3) {
+                ctx.memory_mut(|memory| memory.close_popup());
+                self.context_menu_open = false;
+                self.menu_unfocused_since = None;
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(100));
+            }
+        } else {
+            self.menu_unfocused_since = None;
+        }
         self.context_menu_open = false;
         let dims = Settings::dims_for(self.settings.size);
         egui::CentralPanel::default()
@@ -960,6 +1018,25 @@ impl eframe::App for Haven {
                 height
             };
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(vec2(dims[0], height)));
+            if self.context_menu_open {
+                let (outer, monitor) = ctx.input(|i| {
+                    let viewport = i.viewport();
+                    (viewport.outer_rect, viewport.monitor_size)
+                });
+                if let (Some(outer), Some(monitor)) = (outer, monitor) {
+                    let screen_bottom = monitor.y - 12.0;
+                    if outer.min.y + height > screen_bottom {
+                        self.menu_restore_pos = Some(outer.min);
+                        let moved_y = (screen_bottom - height).max(0.0);
+                        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos2(
+                            outer.min.x,
+                            moved_y,
+                        )));
+                    }
+                }
+            } else if let Some(pos) = self.menu_restore_pos.take() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+            }
         }
         if self.engine.shared.playing.load(Relaxed) {
             ctx.request_repaint_after(Duration::from_millis(33)); // smoother waveform updates
