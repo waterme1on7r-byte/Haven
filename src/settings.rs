@@ -9,6 +9,8 @@ pub struct Settings {
     pub pos: Option<(f32, f32)>,
     /// 0 = small, 1 = medium, 2 = big (default, the original size).
     pub size: u8,
+    /// Waveform style 0..=4.
+    pub wave: u8,
 }
 
 impl Default for Settings {
@@ -18,6 +20,7 @@ impl Default for Settings {
             locked: false,
             pos: None,
             size: 2,
+            wave: 0,
         }
     }
 }
@@ -60,6 +63,11 @@ impl Settings {
                         if let Some(v) = l.strip_prefix("y=") {
                             y = v.parse::<f32>().ok();
                         }
+                        if let Some(v) = l.strip_prefix("wave=") {
+                            if let Ok(n) = v.parse::<u8>() {
+                                s.wave = n.min(4);
+                            }
+                        }
                         if let Some(v) = l.strip_prefix("size=") {
                             if let Ok(n) = v.parse::<u8>() {
                                 s.size = n.min(2);
@@ -84,8 +92,8 @@ impl Settings {
                 let _ = std::fs::create_dir_all(d);
             }
             let mut t = format!(
-                "on_top={}\nlocked={}\nsize={}\n",
-                self.on_top as u8, self.locked as u8, self.size
+                "on_top={}\nlocked={}\nsize={}\nwave={}\n",
+                self.on_top as u8, self.locked as u8, self.size, self.wave
             );
             if let Some((x, y)) = self.pos {
                 t += &format!("x={x}\ny={y}\n");

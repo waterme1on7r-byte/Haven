@@ -302,6 +302,20 @@ impl Core {
             }
             Cmd::Seek(s) => self.seek(s),
             Cmd::Clear => {
+                // Only clear the list: the track that is playing keeps playing.
+                if self.reader.is_some() && self.idx < self.queue.len() {
+                    let keep = self.queue[self.idx].clone();
+                    let keep_info = self.sh.queue_info.lock().unwrap().get(self.idx).cloned();
+                    self.queue = vec![keep];
+                    self.idx = 0;
+                    let mut qi = self.sh.queue_info.lock().unwrap();
+                    qi.clear();
+                    if let Some(i) = keep_info {
+                        qi.push(i);
+                    }
+                    self.sh.current_idx.store(0, Relaxed);
+                    return;
+                }
                 self.queue.clear();
                 self.reader = None;
                 self.pending.clear();

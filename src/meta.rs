@@ -58,6 +58,7 @@ pub fn read(path: &Path) -> TrackInfo {
 
 pub struct Waveform {
     pub peaks: RwLock<Vec<f32>>,
+    pub rms: RwLock<Vec<f32>>,
     pub done: AtomicBool,
 }
 
@@ -65,6 +66,7 @@ pub struct Waveform {
 pub fn spawn_waveform(path: PathBuf) -> Arc<Waveform> {
     let wf = Arc::new(Waveform {
         peaks: RwLock::new(vec![]),
+        rms: RwLock::new(vec![]),
         done: AtomicBool::new(false),
     });
     let w2 = wf.clone();
@@ -75,7 +77,8 @@ pub fn spawn_waveform(path: PathBuf) -> Arc<Waveform> {
         let bin = ((r.rate as f64 / BINS_PER_SEC) as usize).max(1);
         let (mut cnt, mut sum_sq, mut peak) = (0usize, 0.0f64, 0.0f32);
         while let Some(chunk) = r.next_chunk() {
-            let mut local = Vec::new();
+            let mut local_p = Vec::new();
+            let mut local_r = Vec::new();
             for f in chunk.chunks_exact(2) {
                 let frame_peak = f[0].abs().max(f[1].abs());
                 peak = peak.max(frame_peak);
@@ -83,8 +86,9 @@ pub fn spawn_waveform(path: PathBuf) -> Arc<Waveform> {
                 cnt += 1;
                 if cnt == bin {
                     let rms = (sum_sq / cnt as f64).sqrt() as f32;
-                    // Preserve transients while keeping per-window loudness visible.
-                    local.push((rms * 0.72 + peak * 0.28).clamp(0.0, 1.0));
+                    // Keep true peak and RMS apart so the UI can show dynamics.
+                    local_p.push(peak.clamp(0.0, 1.0));
+                    local_r.push(rms.clamp(0.0, 1.0));
                     cnt = 0;
                     sum_sq = 0.0;
                     peak = 0.0;
@@ -93,16 +97,15 @@ pub fn spawn_waveform(path: PathBuf) -> Arc<Waveform> {
             if Arc::strong_count(&w2) == 1 {
                 return;
             }
-            if !local.is_empty() {
-                w2.peaks.write().unwrap().extend(local);
+            if !local_p.is_empty() {
+                w2.peaks.write().unwrap().extend(local_p);
+                w2.rms.write().unwrap().extend(local_r);
             }
         }
         if cnt > 0 {
             let rms = (sum_sq / cnt as f64).sqrt() as f32;
-            w2.peaks
-                .write()
-                .unwrap()
-                .push((rms * 0.72 + peak * 0.28).clamp(0.0, 1.0));
+            w2.peaks.write().unwrap().push(peak.clamp(0.0, 1.0));
+            w2.rms.write().unwrap().push(rms.clamp(0.0, 1.0));
         }
         w2.done.store(true, std::sync::atomic::Ordering::Relaxed);
     });

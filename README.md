@@ -1,20 +1,21 @@
 # Haven
 
-Haven is a compact, lossless desktop audio player built with Rust. Its frameless
-interface combines gapless playback, live waveforms, drag-and-drop loading,
-track metadata, and a hover card into one small native window.
+Haven is a compact, lossless desktop audio player built with Rust. It uses a
+custom frameless interface, gapless playback, live waveforms, a playlist, and
+persisted window settings.
 
 ## Features
 
 - FLAC, MP4/M4A/AAC, MP3, Ogg, WAV, AIFF, and formats supported by Symphonia
 - Gapless queue playback with live waveform rendering
-- Waveform scrubbing and progress-ring seeking
-- Hover metadata card for title, artist, codec, format, and elapsed playback
-- Drag-to-scrub and drag-to-move behavior that avoids unwanted window drags
-- Attached playlist with track selection and queue clearing
+- Five selectable waveform styles
+- Waveform and progress-ring scrubbing
+- Hover metadata card with title, artist, codec, and format details
+- Attached playlist with track selection, shuffle, Open, and Clear controls
+- Drag-and-drop files or folders; dropped media is appended without interrupting playback
 - Small, medium, and big window sizes
-- Always-on-top, position lock, and persistent window settings
-- Drag-and-drop files or folders; Shift+drop appends to the queue
+- Always-on-top and position-lock controls
+- Persistent window size, position, playback, and display preferences
 
 ## Controls
 
@@ -30,9 +31,8 @@ track metadata, and a hover card into one small native window.
 | Move the player | Drag the frame or top-edge grip |
 | Move anywhere | Hold `Alt` on Windows or `Option` on macOS while dragging |
 
-Hover over the waveform while paused or playing to see the track metadata card.
-The right-click menu controls the playlist, player size, minimize, exit,
-always-on-top, and position lock.
+Open adds files or folders to the playlist without replacing the current track.
+Clearing the playlist keeps the current track playing.
 
 ## Install and run
 
@@ -51,7 +51,7 @@ The release executable is `target\release\haven.exe`.
 
 ### macOS
 
-1. Install the command-line tools with `xcode-select --install`.
+1. Install command-line tools with `xcode-select --install`.
 2. Install Rust with `curl https://sh.rustup.rs -sSf | sh`.
 3. Run `cargo run --release`, optionally followed by a file or folder.
 
@@ -66,7 +66,7 @@ cargo packager --release
 
 The `Build Haven` GitHub Actions workflow builds Windows NSIS installers and
 macOS disk images. Pushing a `v*` tag publishes both packages to a GitHub
-release, such as `v0.1.2`.
+release, such as `v0.1.3`.
 
 macOS packages are unsigned until Developer ID signing and notarization
 credentials are configured.
@@ -78,3 +78,6 @@ cargo fmt --check
 cargo check --locked
 cargo build --release
 ```
+
+The icon source is `assets/haven.svg`. Rasterized `.ico`, `.icns`, iconset,
+and `haven-128.rgba` assets should be regenerated whenever the SVG changes.
