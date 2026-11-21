@@ -23,7 +23,7 @@ jobs:
             label: Windows installer
             artifact: Haven-Windows
           - runner: macos-latest
-            format: dmg
+            format: app
             label: macOS disk image
             artifact: Haven-macOS
     steps:
@@ -35,6 +35,16 @@ jobs:
         run: cargo install cargo-packager --locked
       - name: Build package
         run: cargo packager --release --formats ${{ matrix.format }}
+      - name: Sign app and build DMG (macOS)
+        if: matrix.runner == 'macos-latest'
+        run: |
+          # Sign AFTER stripping/bundling so the signature is valid, then
+          # verify it. The DMG is built from the already-signed app.
+          codesign --force --deep --sign - dist/Haven.app
+          codesign --verify --deep --strict --verbose=2 dist/Haven.app
+          file dist/Haven.app/Contents/MacOS/*
+          hdiutil create -volname Haven -srcfolder dist/Haven.app -ov -format UDZO dist/Haven.dmg
+          rm -rf dist/Haven.app
       - name: Upload package artifact
         uses: actions/upload-artifact@v4
         with:

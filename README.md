@@ -28,7 +28,7 @@ Minimal lossless desktop player. Rust · egui (glow) · symphonia · cpal.
 Installers can be built locally with `cargo install cargo-packager --locked` followed by
 `cargo packager --release`. Windows produces an NSIS setup `.exe`; macOS produces a `.dmg`.
 The GitHub Actions workflow builds both formats on their native runners and uploads them as
-workflow artifacts. Pushing a version tag such as `v0.1.4` also publishes the installers as a
+workflow artifacts. Pushing a version tag such as `v0.1.5` also publishes the installers as a
 GitHub release. macOS packages are unsigned until a Developer ID certificate and notarization
 are configured.
 
@@ -63,7 +63,7 @@ is only rebuilt when the sample rate changes.
 `assets/haven.svg` is the single source. The `.ico`, `.icns`, `haven.iconset/*.png` and `haven-128.rgba` (window icon, embedded in the binary) are rasterised from it with fully transparent corners. Re-export all of them if the SVG changes.
 
 ## macOS: "haven is damaged and can't be opened"
-Builds are ad-hoc signed, not notarized (no Apple Developer account). Gatekeeper still flags anything downloaded in a browser. Drag Haven.app to Applications, then run once in Terminal:
+CI ad-hoc signs and verifies the app (no Apple Developer account, so no notarization). An app with no valid signature is reported as "damaged" on Apple Silicon; Gatekeeper may still flag browser downloads. Drag Haven.app to Applications, then run once in Terminal:
 
     xattr -cr /Applications/Haven.app
 
