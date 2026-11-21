@@ -68,7 +68,7 @@ cargo packager --release
 
 The `Build Haven` GitHub Actions workflow builds Windows NSIS installers and macOS disk
 images on their respective platforms. Pushing a `v*` tag publishes both packages to a
-GitHub release.
+GitHub release (for example, `v0.1.1`).
 
 macOS packages are unsigned until Developer ID signing and notarization credentials are
 configured.
