@@ -4,6 +4,7 @@ on:
   push:
     branches: [main, waterme1on7r-byte-haven-source-update]
     paths:
+      - "index.html"
       - "site/**"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
@@ -24,14 +25,20 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-latest
     steps:
-      - name: Check out site
+      - name: Check out repository
         uses: actions/checkout@v4
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
-      - name: Upload site
+      - name: Prepare root page artifact
+        run: |
+          mkdir -p _site/assets
+          cp index.html _site/index.html
+          cp site/haven.css site/player-motion.js site/share.jpg _site/
+          cp -R site/assets/. _site/assets/
+      - name: Upload root page
         uses: actions/upload-pages-artifact@v3
         with:
-          path: ./site
+          path: ./_site
       - name: Deploy site
         id: deployment
         uses: actions/deploy-pages@v4
