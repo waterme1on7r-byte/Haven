@@ -2,6 +2,8 @@
 
 mod app;
 mod engine;
+#[cfg(target_os = "macos")]
+mod macos_open;
 mod meta;
 mod reader;
 mod settings;

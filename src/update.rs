@@ -1,8 +1,11 @@
-//! Update check + download over GitHub Releases.
+//! Update check + one-click install over GitHub Releases.
 //!
-//! Haven never replaces its own binary: it finds the newest release, downloads the
-//! installer for this platform (.exe on Windows, .dmg on macOS) and opens it. Files
-//! fetched this way carry no quarantine flag, so macOS does not flag them as damaged.
+//! Flow: find the newest release -> download the installer for this platform (.exe on
+//! Windows, .dmg on macOS) -> launch a small helper script and quit. The helper waits for
+//! Haven to exit, installs silently (Windows: the NSIS installer with `/S`; macOS: copies
+//! the app out of the disk image over the running bundle), then starts the new Haven.
+//! If the automatic install is not possible the installer is simply opened, as before.
+//! Files fetched this way carry no quarantine flag, so macOS does not flag them as damaged.
 use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -10,7 +13,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-/// "owner/repository" on GitHub that publishes Haven's releases. CHANGE THIS.
+/// "owner/repository" on GitHub that publishes Haven's releases.
 pub const REPO: &str = "waterme1on7r-byte/Haven";
 const CHECK_EVERY_SECS: u64 = 24 * 60 * 60;
 
@@ -20,6 +23,7 @@ pub struct Release {
     pub page: String,
     pub asset_name: Option<String>,
     pub asset_url: Option<String>,
+    pub asset_size: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -29,8 +33,19 @@ pub enum State {
     UpToDate,
     Available(Release),
     Downloading(Release, u64, u64), // done, total bytes (total 0 = unknown)
+    /// Installer handed to the helper script; Haven is about to quit and restart.
+    Installing,
+    /// Automatic install was not possible; the installer was opened for the user.
     Downloaded(PathBuf),
-    Failed(String),
+    /// Short reason; `Some(release)` when it was the download/install that failed.
+    Failed(String, Option<Release>),
+}
+
+fn is_busy(s: &State) -> bool {
+    matches!(
+        s,
+        State::Checking | State::Downloading(..) | State::Installing
+    )
 }
 
 #[derive(Clone)]
@@ -58,10 +73,12 @@ impl Updater {
     }
 
     pub fn busy(&self) -> bool {
-        matches!(
-            *self.state.lock().unwrap(),
-            State::Checking | State::Downloading(..)
-        )
+        is_busy(&self.state.lock().unwrap())
+    }
+
+    /// True once the helper script is running and Haven should close its window.
+    pub fn installing(&self) -> bool {
+        matches!(*self.state.lock().unwrap(), State::Installing)
     }
 
     fn set(&self, s: State) {
@@ -82,15 +99,19 @@ impl Updater {
 
     /// Manual check (Settings -> Updates).
     pub fn check(&self) {
-        if self.busy() {
-            return;
-        }
         let me = self.clone();
         std::thread::spawn(move || me.run_check());
     }
 
     fn run_check(&self) {
-        self.set(State::Checking);
+        {
+            // Never replace a running check/download/install with a new check.
+            let mut s = self.state.lock().unwrap();
+            if is_busy(&s) {
+                return;
+            }
+            *s = State::Checking;
+        }
         match fetch_latest() {
             Ok(Some(rel)) => {
                 stamp();
@@ -100,60 +121,103 @@ impl Updater {
                 stamp();
                 self.set(State::UpToDate);
             }
-            Err(e) => self.set(State::Failed(e.to_string())),
+            Err(e) => self.set(State::Failed(e.to_string(), None)),
         }
     }
 
-    /// Downloads the installer for this platform and opens it.
+    /// Downloads the installer for this platform, then installs it and restarts Haven.
     pub fn download(&self, rel: Release) {
         let (Some(url), Some(name)) = (rel.asset_url.clone(), rel.asset_name.clone()) else {
             open_path_or_url(&rel.page); // no matching file: show the release page
             return;
         };
+        {
+            // The state flips to "Downloading" here, before the thread starts, so a
+            // second click can never start a second download over the same file.
+            let mut s = self.state.lock().unwrap();
+            if is_busy(&s) {
+                return;
+            }
+            *s = State::Downloading(rel.clone(), 0, rel.asset_size);
+        }
         let me = self.clone();
         std::thread::spawn(move || match me.run_download(&rel, &url, &name) {
-            Ok(p) => {
-                open_path_or_url(&p.to_string_lossy());
-                me.set(State::Downloaded(p));
-            }
-            Err(e) => me.set(State::Failed(e.to_string())),
+            Ok(path) => me.install(path),
+            Err(e) => me.set(State::Failed(e.to_string(), Some(rel))),
         });
     }
 
     fn run_download(&self, rel: &Release, url: &str, name: &str) -> anyhow::Result<PathBuf> {
-        let resp = agent().get(url).call()?;
+        let resp = agent().get(url).call().map_err(net_err)?;
         let total: u64 = resp
             .header("Content-Length")
             .and_then(|h| h.parse().ok())
-            .unwrap_or(0);
+            .unwrap_or(rel.asset_size);
         let file_name = Path::new(name)
             .file_name()
             .map(|n| n.to_os_string())
             .ok_or_else(|| anyhow::anyhow!("bad file name"))?;
-        let dir = download_dir();
+        let dir = update_dir();
+        let _ = std::fs::remove_dir_all(&dir); // stale installers / .part files
         std::fs::create_dir_all(&dir)?;
-        let path = dir.join(file_name);
-        let tmp = dir.join(format!("{}.part", path.file_name().unwrap().to_string_lossy()));
+        let path = dir.join(&file_name);
+        let tmp = dir.join(format!("{}.part", file_name.to_string_lossy()));
         self.set(State::Downloading(rel.clone(), 0, total));
-        let mut reader = resp.into_reader();
-        let mut f = std::fs::File::create(&tmp)?;
-        let mut buf = vec![0u8; 64 * 1024];
-        let (mut done, mut last) = (0u64, Instant::now());
-        loop {
-            let n = reader.read(&mut buf)?;
-            if n == 0 {
-                break;
+
+        let result = (|| -> anyhow::Result<u64> {
+            let mut reader = resp.into_reader();
+            let mut f = std::fs::File::create(&tmp)?;
+            let mut buf = vec![0u8; 64 * 1024];
+            let (mut done, mut last) = (0u64, Instant::now());
+            loop {
+                let n = reader.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                f.write_all(&buf[..n])?;
+                done += n as u64;
+                if last.elapsed() > Duration::from_millis(200) {
+                    self.set(State::Downloading(rel.clone(), done, total));
+                    last = Instant::now();
+                }
             }
-            f.write_all(&buf[..n])?;
-            done += n as u64;
-            if last.elapsed() > Duration::from_millis(200) {
-                self.set(State::Downloading(rel.clone(), done, total));
-                last = Instant::now();
+            f.flush()?;
+            f.sync_all()?;
+            Ok(done)
+        })();
+        let done = match result {
+            Ok(d) => d,
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e);
             }
+        };
+        if (total > 0 && done != total) || done < 100_000 {
+            let _ = std::fs::remove_file(&tmp);
+            anyhow::bail!("download incomplete");
         }
-        drop(f);
+        self.set(State::Downloading(rel.clone(), done, done));
         std::fs::rename(&tmp, &path)?;
         Ok(path)
+    }
+
+    /// Hands the downloaded installer to the helper script and quits. When that is not
+    /// possible, falls back to opening the installer for the user.
+    fn install(&self, path: PathBuf) {
+        match apply_update(&path) {
+            Ok(()) => {
+                self.set(State::Installing); // the UI closes the window
+                                             // If the window has not ended the process in a few seconds, end it here
+                                             // so the helper (which waits for Haven to exit) can go ahead.
+                std::thread::sleep(Duration::from_secs(5));
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("haven: automatic install unavailable: {e}");
+                open_path_or_url(&path.to_string_lossy());
+                self.set(State::Downloaded(path));
+            }
+        }
     }
 }
 
@@ -165,12 +229,29 @@ fn agent() -> ureq::Agent {
         .build()
 }
 
+/// Short, readable reason for the Settings row.
+fn net_err(e: ureq::Error) -> anyhow::Error {
+    match e {
+        ureq::Error::Status(404, _) => anyhow::anyhow!("release not found (404)"),
+        ureq::Error::Status(403, _) | ureq::Error::Status(429, _) => {
+            anyhow::anyhow!("GitHub rate limit, try later")
+        }
+        ureq::Error::Status(c, _) => anyhow::anyhow!("server error {c}"),
+        ureq::Error::Transport(_) => anyhow::anyhow!("no connection"),
+    }
+}
+
+fn update_dir() -> PathBuf {
+    std::env::temp_dir().join("Haven-update")
+}
+
 fn fetch_latest() -> anyhow::Result<Option<Release>> {
     let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
     let v: serde_json::Value = agent()
         .get(&url)
         .set("Accept", "application/vnd.github+json")
-        .call()?
+        .call()
+        .map_err(net_err)?
         .into_json()?;
     let tag = v["tag_name"]
         .as_str()
@@ -179,20 +260,21 @@ fn fetch_latest() -> anyhow::Result<Option<Release>> {
         return Ok(None);
     }
     let assets: Vec<serde_json::Value> = v["assets"].as_array().cloned().unwrap_or_default();
-    let (asset_name, asset_url) = match pick_asset(&assets) {
-        Some((n, u)) => (Some(n), Some(u)),
-        None => (None, None),
+    let (asset_name, asset_url, asset_size) = match pick_asset(&assets) {
+        Some((n, u, z)) => (Some(n), Some(u), z),
+        None => (None, None, 0),
     };
     Ok(Some(Release {
         version: tag.trim_start_matches(['v', 'V']).to_string(),
         page: v["html_url"].as_str().unwrap_or("").to_string(),
         asset_name,
         asset_url,
+        asset_size,
     }))
 }
 
 /// The installer for this OS, preferring the one that matches the CPU.
-fn pick_asset(assets: &[serde_json::Value]) -> Option<(String, String)> {
+fn pick_asset(assets: &[serde_json::Value]) -> Option<(String, String, u64)> {
     let ext = if cfg!(windows) {
         ".exe"
     } else if cfg!(target_os = "macos") {
@@ -205,7 +287,7 @@ fn pick_asset(assets: &[serde_json::Value]) -> Option<(String, String)> {
     } else {
         &["x64", "x86_64", "amd64"]
     };
-    let mut best: Option<(bool, String, String)> = None;
+    let mut best: Option<(bool, String, String, u64)> = None;
     for a in assets {
         if let (Some(name), Some(url)) = (a["name"].as_str(), a["browser_download_url"].as_str()) {
             let lower = name.to_lowercase();
@@ -214,11 +296,16 @@ fn pick_asset(assets: &[serde_json::Value]) -> Option<(String, String)> {
             }
             let arch_ok = arch.iter().any(|t| lower.contains(t));
             if best.as_ref().map_or(true, |b| arch_ok && !b.0) {
-                best = Some((arch_ok, name.to_string(), url.to_string()));
+                best = Some((
+                    arch_ok,
+                    name.to_string(),
+                    url.to_string(),
+                    a["size"].as_u64().unwrap_or(0),
+                ));
             }
         }
     }
-    best.map(|(_, n, u)| (n, u))
+    best.map(|(_, n, u, z)| (n, u, z))
 }
 
 fn parse_version(v: &str) -> Vec<u64> {
@@ -233,22 +320,15 @@ fn parse_version(v: &str) -> Vec<u64> {
 pub fn newer(remote: &str, local: &str) -> bool {
     let (a, b) = (parse_version(remote), parse_version(local));
     for i in 0..a.len().max(b.len()) {
-        let (x, y) = (a.get(i).copied().unwrap_or(0), b.get(i).copied().unwrap_or(0));
+        let (x, y) = (
+            a.get(i).copied().unwrap_or(0),
+            b.get(i).copied().unwrap_or(0),
+        );
         if x != y {
             return x > y;
         }
     }
     false
-}
-
-fn download_dir() -> PathBuf {
-    let home = if cfg!(windows) {
-        std::env::var_os("USERPROFILE")
-    } else {
-        std::env::var_os("HOME")
-    };
-    home.map(|h| PathBuf::from(h).join("Downloads"))
-        .unwrap_or_else(std::env::temp_dir)
 }
 
 fn stamp_path() -> Option<PathBuf> {
@@ -276,6 +356,127 @@ fn stamp() {
         }
         let _ = std::fs::write(p, now_secs().to_string());
     }
+}
+
+/// Runs a helper that waits for this process to exit, installs `installer` silently
+/// and starts the new Haven. All paths reach the helper through environment variables
+/// (not through the script text), so non-ASCII user names and spaces are safe.
+#[cfg(windows)]
+fn apply_update(installer: &Path) -> anyhow::Result<()> {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+    // The NSIS installer is per-user (no administrator prompt) and `/S` makes it silent.
+    const SCRIPT: &str = r#"@echo off
+setlocal
+set /a N=0
+:wait
+tasklist /FI "PID eq %HAVEN_PID%" /NH 2>nul | find "%HAVEN_PID%" >nul
+if errorlevel 1 goto go
+set /a N+=1
+if %N% geq 40 goto go
+ping -n 2 127.0.0.1 >nul
+goto wait
+:go
+ping -n 2 127.0.0.1 >nul
+start "" /wait "%HAVEN_INSTALLER%" /S
+set "NEW=%LOCALAPPDATA%\Haven\haven.exe"
+if /I "%HAVEN_APP%"=="%NEW%" goto launch_app
+if exist "%NEW%" goto launch_new
+:launch_app
+start "" "%HAVEN_APP%"
+goto done
+:launch_new
+start "" "%NEW%"
+:done
+del /f /q "%HAVEN_INSTALLER%" >nul 2>&1
+(goto) 2>nul & del /f /q "%~f0"
+"#;
+    let app = std::env::current_exe()?;
+    let script = std::env::temp_dir().join("haven-update.cmd");
+    std::fs::write(&script, SCRIPT.replace('\n', "\r\n"))?;
+    Command::new("cmd")
+        .arg("/D")
+        .arg("/C")
+        .raw_arg(format!("\"\"{}\"\"", script.display()))
+        .env("HAVEN_PID", std::process::id().to_string())
+        .env("HAVEN_INSTALLER", installer)
+        .env("HAVEN_APP", &app)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(0x0800_0000 | 0x0000_0200) // CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+        .spawn()?;
+    Ok(())
+}
+
+/// macOS: waits for Haven to quit, swaps the app out of the disk image into the place
+/// the running Haven.app lives, and reopens it. If the bundle cannot be replaced (no
+/// permission, not running from an .app) the old app is reopened and the disk image shown.
+#[cfg(target_os = "macos")]
+fn apply_update(dmg: &Path) -> anyhow::Result<()> {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+    const SCRIPT: &str = r#"#!/bin/sh
+i=0
+while kill -0 "$HAVEN_PID" 2>/dev/null && [ "$i" -lt 60 ]; do sleep 0.5; i=$((i+1)); done
+OK=0
+MNT=$(mktemp -d /tmp/haven-update.XXXXXX)
+if hdiutil attach "$HAVEN_DMG" -nobrowse -noverify -noautoopen -quiet -mountpoint "$MNT" >/dev/null 2>&1; then
+  SRC=$(find "$MNT" -maxdepth 1 -name '*.app' | head -n 1)
+  if [ -z "$SRC" ] && [ -d "$MNT/Contents/MacOS" ]; then SRC="$MNT"; fi
+  if [ -n "$SRC" ]; then
+    NEWAPP="$HAVEN_APP.update"
+    OLDAPP="$HAVEN_APP.old"
+    rm -rf "$NEWAPP" "$OLDAPP"
+    if ditto "$SRC" "$NEWAPP" 2>/dev/null; then
+      if mv "$HAVEN_APP" "$OLDAPP" 2>/dev/null; then
+        if mv "$NEWAPP" "$HAVEN_APP" 2>/dev/null; then
+          OK=1
+          rm -rf "$OLDAPP"
+          xattr -cr "$HAVEN_APP" >/dev/null 2>&1
+        else
+          mv "$OLDAPP" "$HAVEN_APP"
+        fi
+      fi
+    fi
+    rm -rf "$NEWAPP"
+  fi
+  hdiutil detach "$MNT" -quiet -force >/dev/null 2>&1
+fi
+rmdir "$MNT" 2>/dev/null
+if [ "$OK" = 1 ]; then
+  rm -f "$HAVEN_DMG"
+  open "$HAVEN_APP"
+else
+  open "$HAVEN_APP"
+  open "$HAVEN_DMG"
+fi
+rm -f "$0"
+"#;
+    let exe = std::env::current_exe()?;
+    let app = exe
+        .ancestors()
+        .find(|p| p.extension().and_then(|e| e.to_str()) == Some("app"))
+        .ok_or_else(|| anyhow::anyhow!("not running from an .app bundle"))?
+        .to_path_buf();
+    let script = std::env::temp_dir().join("haven-update.sh");
+    std::fs::write(&script, SCRIPT)?;
+    Command::new("/bin/sh")
+        .arg(&script)
+        .env("HAVEN_PID", std::process::id().to_string())
+        .env("HAVEN_DMG", dmg)
+        .env("HAVEN_APP", &app)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()?;
+    Ok(())
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn apply_update(_installer: &Path) -> anyhow::Result<()> {
+    anyhow::bail!("automatic install is not supported on this platform")
 }
 
 /// Opens a file (installer / disk image) or a web page with the OS default handler.

@@ -39,6 +39,11 @@ pub struct Shared {
     eq_on: AtomicBool,
     eq_gain: [AtomicU32; 10],
     eq_gen: AtomicU64,
+    /// Id of the system's current default output device (0 = unknown). Kept fresh by a
+    /// small watcher thread so the audio thread never has to ask the OS itself.
+    default_dev: AtomicU64,
+    /// Set by the stream's error callback when its device went away (unplugged etc.).
+    dev_lost: AtomicBool,
 }
 
 /// Centre frequencies of the ten equalizer bands (Hz), one octave apart.
@@ -65,6 +70,8 @@ impl Shared {
             eq_on: AtomicBool::new(false),
             eq_gain: std::array::from_fn(|_| AtomicU32::new(0.0f32.to_bits())),
             eq_gen: AtomicU64::new(1),
+            default_dev: AtomicU64::new(0),
+            dev_lost: AtomicBool::new(false),
         }
     }
     /// Sets the equalizer (gains in dB). The decoder thread picks it up on its next block.
@@ -87,7 +94,8 @@ enum Cmd {
     Queue(Vec<PathBuf>, usize),
     Append(Vec<PathBuf>),
     Select(usize),
-    Toggle,
+    /// Explicit target state (never a blind flip, so queued clicks cannot cancel out).
+    Play(bool),
     Next,
     Prev,
     Seek(f64),
@@ -110,6 +118,15 @@ impl Engine {
             .name("haven-audio".into())
             .spawn(move || Core::new(s).run(rx))
             .expect("spawn audio thread");
+        // Follows the system's default output device (headphones plugged in, output
+        // switched in the OS...). The audio thread compares it with the open stream.
+        let w = shared.clone();
+        let _ = thread::Builder::new()
+            .name("haven-devwatch".into())
+            .spawn(move || loop {
+                w.default_dev.store(default_dev_id(), Relaxed);
+                thread::sleep(Duration::from_millis(500));
+            });
         Self { tx, shared }
     }
     pub fn queue(&self, p: Vec<PathBuf>) {
@@ -121,8 +138,14 @@ impl Engine {
     pub fn select(&self, index: usize) {
         let _ = self.tx.send(Cmd::Select(index));
     }
+    /// Play/pause. The new state is decided here, from what the button shows, and is
+    /// applied at once (so the icon flips immediately); the engine thread gets the
+    /// explicit target. Extra clicks while the engine is busy can no longer cancel
+    /// each other out.
     pub fn toggle(&self) {
-        let _ = self.tx.send(Cmd::Toggle);
+        let want = !self.shared.playing.load(Relaxed);
+        self.shared.playing.store(want, Relaxed);
+        let _ = self.tx.send(Cmd::Play(want));
     }
     pub fn next(&self) {
         let _ = self.tx.send(Cmd::Next);
@@ -143,6 +166,27 @@ struct Out {
     prod: Producer<f32>,
     rate: u32,
     cap: usize,
+    dev: u64, // id of the device this stream plays on
+}
+
+fn fnv1a(b: &[u8]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for x in b {
+        h ^= *x as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
+
+/// Stable id of an output device (hash of its name; never 0).
+fn dev_id(d: &cpal::Device) -> u64 {
+    d.name().map_or(0, |n| fnv1a(n.as_bytes()) | 1)
+}
+
+fn default_dev_id() -> u64 {
+    cpal::default_host()
+        .default_output_device()
+        .map_or(0, |d| dev_id(&d))
 }
 
 /// Opens the default device at the file's native rate when the device supports it
@@ -171,6 +215,8 @@ fn open_out(want: u32, sh: &Arc<Shared>) -> Result<Out> {
     }
     let rate = cfg.sample_rate().0;
     let ch = cfg.channels() as usize;
+    let dev_key = dev_id(&dev);
+    let s_err = sh.clone();
     let cap = rate as usize * 2 * 3 / 10; // ~300 ms of stereo
     let (prod, mut cons) = RingBuffer::<f32>::new(cap);
     let s = sh.clone();
@@ -197,7 +243,12 @@ fn open_out(want: u32, sh: &Arc<Shared>) -> Result<Out> {
                 }
             }
         },
-        |e| eprintln!("haven: audio error: {e}"),
+        move |e| {
+            eprintln!("haven: audio error: {e}");
+            if matches!(e, cpal::StreamError::DeviceNotAvailable) {
+                s_err.dev_lost.store(true, Relaxed); // the audio thread reopens on the default device
+            }
+        },
         None,
     )?;
     stream.play()?;
@@ -206,6 +257,7 @@ fn open_out(want: u32, sh: &Arc<Shared>) -> Result<Out> {
         prod,
         rate,
         cap,
+        dev: dev_key,
     })
 }
 
@@ -334,6 +386,9 @@ struct Core {
     pushed: u64, // samples pushed since `base`
     rng: u64,
     eq: EqDsp,
+    /// End of the queue reached: waiting (without blocking) for the ring to empty.
+    tail: Option<Instant>,
+    dev_retry: Instant,
 }
 
 impl Core {
@@ -350,6 +405,8 @@ impl Core {
             pushed: 0,
             rng: 0x9E37_79B9_7F4A_7C15,
             eq: EqDsp::new(),
+            tail: None,
+            dev_retry: Instant::now(),
         }
     }
 
@@ -360,6 +417,14 @@ impl Core {
                     Ok(c) => self.cmd(c),
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => return,
+                }
+            }
+            self.follow_device();
+            if let Some(t) = self.tail {
+                let empty = self.out.as_ref().map_or(true, |o| o.prod.slots() >= o.cap);
+                if empty || t.elapsed() > Duration::from_secs(2) {
+                    self.tail = None;
+                    self.sh.playing.store(false, Relaxed);
                 }
             }
             let mut worked = false;
@@ -407,15 +472,20 @@ impl Core {
                     self.start_from(i, false);
                 }
             }
-            Cmd::Toggle => {
-                if self.reader.is_none() && !self.queue.is_empty() {
-                    self.sh.playing.store(true, Relaxed);
-                    self.start_from(0, false);
+            Cmd::Play(true) => {
+                if self.reader.is_none() {
+                    // Nothing is loaded in the decoder (the queue ended): start it again.
+                    if self.queue.is_empty() {
+                        self.sh.playing.store(false, Relaxed);
+                    } else {
+                        self.sh.playing.store(true, Relaxed);
+                        self.start_from(0, false);
+                    }
                 } else {
-                    let p = self.sh.playing.load(Relaxed);
-                    self.sh.playing.store(!p, Relaxed);
+                    self.sh.playing.store(true, Relaxed);
                 }
             }
+            Cmd::Play(false) => self.sh.playing.store(false, Relaxed),
             Cmd::Next => {
                 if let Some(i) = self.next_idx(false) {
                     self.sh.playing.store(true, Relaxed);
@@ -453,6 +523,7 @@ impl Core {
                 }
                 self.queue.clear();
                 self.reader = None;
+                self.tail = None;
                 self.pending.clear();
                 self.poff = 0;
                 self.flush();
@@ -501,6 +572,7 @@ impl Core {
     }
 
     fn start_from(&mut self, mut idx: usize, gapless: bool) {
+        self.tail = None;
         for _ in 0..self.queue.len() {
             if self.start(idx, gapless) {
                 self.idx = idx;
@@ -601,9 +673,45 @@ impl Core {
         match self.next_idx(true) {
             Some(i) => self.start_from(i, true),
             None => {
-                self.drain();
-                self.sh.playing.store(false, Relaxed);
+                // Let the last ~300 ms play out, but do not block this thread meanwhile:
+                // clicks that arrive now are handled at once (see `tail` in `run`).
+                self.tail = Some(Instant::now());
             }
+        }
+    }
+
+    /// Moves playback to the system's current default output device when it changes
+    /// (or when the device in use disappears). Resumes from where it was audible.
+    fn follow_device(&mut self) {
+        let Some(o) = self.out.as_ref() else {
+            return;
+        };
+        let lost = self.sh.dev_lost.load(Relaxed);
+        let cur = self.sh.default_dev.load(Relaxed);
+        if !lost && (cur == 0 || cur == o.dev) {
+            return;
+        }
+        if Instant::now() < self.dev_retry {
+            return;
+        }
+        self.dev_retry = Instant::now() + Duration::from_millis(1000);
+        let rate = o.rate;
+        let pos = self.sh.pos_ms.load(Relaxed) as f64 / 1000.0;
+        match open_out(rate, &self.sh) {
+            Ok(new) => {
+                let new_rate = new.rate;
+                self.out = Some(new); // drops the old stream
+                self.sh.dev_lost.store(false, Relaxed);
+                if let Some(r) = self.reader.as_mut() {
+                    r.set_out_rate(new_rate);
+                }
+                self.pending.clear();
+                self.poff = 0;
+                if self.reader.is_some() {
+                    self.seek(pos); // the old ring's ~300 ms is gone: replay it on the new device
+                }
+            }
+            Err(e) => eprintln!("haven: switching output device: {e}"),
         }
     }
 

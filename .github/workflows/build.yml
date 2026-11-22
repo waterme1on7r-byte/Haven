@@ -42,6 +42,33 @@ jobs:
         run: cargo install cargo-packager --locked
       - name: Build package
         run: cargo packager --release --formats ${{ matrix.format }}
+      - name: Declare supported audio types (macOS)
+        if: matrix.runner == 'macos-latest'
+        run: |
+          python3 - <<'PY'
+          import plistlib
+          p = "dist/Haven.app/Contents/Info.plist"
+          with open(p, "rb") as f:
+              d = plistlib.load(f)
+          d["CFBundleDocumentTypes"] = [{
+              "CFBundleTypeName": "Audio",
+              "CFBundleTypeRole": "Viewer",
+              "LSHandlerRank": "Alternate",
+              "LSItemContentTypes": [
+                  "public.audio", "public.mp3", "org.xiph.flac",
+                  "com.microsoft.waveform-audio", "public.aiff-audio",
+                  "public.aifc-audio", "com.apple.m4a-audio",
+                  "public.mpeg-4-audio",
+              ],
+              "CFBundleTypeExtensions": [
+                  "mp3", "flac", "wav", "aif", "aiff", "m4a", "aac",
+                  "ogg", "oga",
+              ],
+          }]
+          with open(p, "wb") as f:
+              plistlib.dump(d, f)
+          PY
+          plutil -p dist/Haven.app/Contents/Info.plist
       - name: Sign app and build DMG (macOS)
         if: matrix.runner == 'macos-latest'
         run: |

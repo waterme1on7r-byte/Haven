@@ -87,6 +87,11 @@ pub struct Haven {
     layout_until: Option<Instant>,
     // Keep repainting briefly after input so play/pause state is never shown stale.
     poll_until: Option<Instant>,
+    // The play/pause state the last frame actually drew; if the engine changes it
+    // right after, one more frame is requested so the icon is never left stale.
+    drawn_playing: bool,
+    // Set once Haven has asked its window to close for an update restart.
+    quit_sent: bool,
 }
 
 fn scan(paths: &[PathBuf]) -> Vec<PathBuf> {
@@ -262,6 +267,8 @@ impl Haven {
         listener: std::net::TcpListener,
     ) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
+        #[cfg(target_os = "macos")]
+        crate::macos_open::install(); // Finder "Open With" / double-click
         let engine = Engine::new();
         let q = scan(&args);
         if !q.is_empty() {
@@ -316,6 +323,8 @@ impl Haven {
             req: [0.0, d[0], d[1]],
             layout_until: None,
             poll_until: None,
+            drawn_playing: false,
+            quit_sent: false,
         }
     }
 
@@ -565,6 +574,7 @@ impl Haven {
         // ---- transport (stays open so you can skip around) ----
         let ty = rect.top() + pad + 21.0;
         let playing = sh.playing.load(Relaxed);
+        self.drawn_playing = playing;
         let has_media = !sh.queue_info.lock().unwrap().is_empty();
         let prev = Rect::from_center_size(pos2(left + 17.0, ty), vec2(34.0, 34.0));
         let next = Rect::from_center_size(pos2(right - 17.0, ty), vec2(34.0, 34.0));
@@ -1026,7 +1036,9 @@ impl Haven {
             BTN_FACE.gamma_multiply(hot),
             Stroke::new(r * 0.04, Color32::from_rgb(0x08, 0x08, 0x09)),
         );
-        if sh.playing.load(Relaxed) {
+        let playing_now = sh.playing.load(Relaxed);
+        self.drawn_playing = playing_now;
+        if playing_now {
             let (bw, bh, gap) = (d * 0.105, d * 0.315, d * 0.11);
             for s in [-1.0f32, 1.0] {
                 let c = pos2(bc.x + s * (gap / 2.0 + bw / 2.0), bc.y);
@@ -1981,7 +1993,7 @@ impl Haven {
                 format!("Version {} is available", r.version),
                 true,
                 if r.asset_url.is_some() {
-                    "Download"
+                    "Update"
                 } else {
                     "Open page"
                 },
@@ -1990,7 +2002,7 @@ impl Haven {
             ),
             State::Downloading(_, d, t) => (
                 if *t > 0 {
-                    format!("Downloading… {}%", d * 100 / t)
+                    format!("Downloading… {}%", (d * 100 / t).min(100))
                 } else {
                     "Downloading…".into()
                 },
@@ -1999,15 +2011,25 @@ impl Haven {
                 false,
                 false,
             ),
+            State::Installing => (
+                "Installing — Haven restarts by itself…".into(),
+                true,
+                "…",
+                false,
+                false,
+            ),
             State::Downloaded(_) => (
-                "Installer opened — quit Haven to finish".into(),
+                "Couldn't install by itself — installer opened".into(),
                 true,
                 "Open",
                 false,
                 true,
             ),
-            State::Failed(_) => (
-                "Couldn't check for updates".into(),
+            State::Failed(msg, Some(_)) => {
+                (format!("Update failed: {msg}"), false, "Retry", false, true)
+            }
+            State::Failed(msg, None) => (
+                format!("Couldn't check: {msg}"),
                 false,
                 "Retry",
                 false,
@@ -2030,10 +2052,20 @@ impl Haven {
         if Self::pill_button(ui, br, "update-btn", btn, primary, enabled) {
             match &st {
                 State::Available(r) => self.updater.download(r.clone()),
+                State::Failed(_, Some(r)) => self.updater.download(r.clone()),
                 State::Downloaded(p) => crate::update::open_path_or_url(&p.to_string_lossy()),
                 _ => self.updater.check(),
             }
         }
+
+        // signature
+        painter.text(
+            pos2(rect.center().x, rect.bottom() - 21.0),
+            Align2::CENTER_CENTER,
+            "WTMLJR",
+            FontId::proportional(10.0),
+            Color32::from_gray(0x5e),
+        );
     }
 
     /// Sends the equalizer state to the audio thread and schedules a save.
@@ -2829,7 +2861,16 @@ impl eframe::App for Haven {
                 self.poll_until = None;
             }
         }
-        if self.engine.shared.playing.load(Relaxed) {
+        // The update is installing: close the window (the helper script restarts Haven).
+        if self.updater.installing() && !self.quit_sent {
+            self.quit_sent = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        let playing_after = self.engine.shared.playing.load(Relaxed);
+        if playing_after != self.drawn_playing {
+            ctx.request_repaint(); // e.g. the last track just ended: redraw the play icon
+        }
+        if playing_after {
             ctx.request_repaint_after(Duration::from_millis(33)); // smoother waveform updates
         } else if self.drag.is_some() {
             ctx.request_repaint_after(Duration::from_millis(30));
