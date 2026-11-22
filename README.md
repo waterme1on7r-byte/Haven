@@ -1,59 +1,104 @@
 # Haven
 
-Minimal lossless desktop player. Rust · egui (glow) · symphonia · cpal.
+Haven is a compact, frameless desktop audio player for Windows and macOS. It keeps playback controls, waveform seeking, queue management, and system window controls in a small floating player.
 
-## Build & run
+![Haven player with playlist](docs/screens/player-playlist.png)
 
-### Windows 10/11
-1. Install Rust: https://rustup.rs  (choose the MSVC toolchain)
-2. Install "Build Tools for Visual Studio" with the *Desktop development with C++* workload.
-3. `cargo run --release`  — or `cargo run --release -- "D:\Music\Album"`
-4. Binary: `target\release\haven.exe`
+## Features
 
-### macOS 12+
-1. `xcode-select --install`
-2. Install Rust: `curl https://sh.rustup.rs -sSf | sh`
-3. `cargo run --release`  — or `cargo run --release -- ~/Music/Album`
-4. Universal binary:
-   ```
-   rustup target add aarch64-apple-darwin x86_64-apple-darwin
-   cargo build --release --target aarch64-apple-darwin
-   cargo build --release --target x86_64-apple-darwin
-   lipo -create -output haven target/aarch64-apple-darwin/release/haven target/x86_64-apple-darwin/release/haven
-   ```
-5. `.app` bundle + signing: `cargo install cargo-packager` (or cargo-bundle), then codesign + notarize.
+- Plays FLAC, ALAC/M4A, WAV, AIFF, MP3, AAC, OGG/OGA, and supported audio in MP4 containers.
+- Opens individual files or scans a folder into a queue.
+- Accepts file and folder drag and drop. Hold `Shift` while dropping to append instead of replacing the queue.
+- Renders a waveform from the media itself, with click-to-seek and drag-to-scrub controls.
+- Shows elapsed and remaining time around the active playhead.
+- Supports play/pause, previous, next, volume, mute, shuffle, repeat off, repeat all, and repeat one.
+- Includes a playlist attached beneath the player, with current-track details, row selection, scrolling, and Clear/Close actions.
+- Provides small, medium, and big player sizes. Big is the original size.
+- Supports Always on top, lock position, minimize, and exit from the right-click menu.
+- Dims to 50% opacity when the player loses focus and returns to full opacity when it regains focus.
+- Keeps one Haven process running at a time.
+- Uses the Signal app icon in the player window and packaged app assets.
 
-## Installers and GitHub builds
+## Screens
 
-Installers can be built locally with `cargo install cargo-packager --locked` followed by
-`cargo packager --release`. Windows produces an NSIS setup `.exe`; macOS produces a `.dmg`.
-The GitHub Actions workflow builds both formats on their native runners and uploads them as
-workflow artifacts. Pushing a version tag such as `v0.1.0` also publishes the installers as a
-GitHub release. macOS packages are unsigned until a Developer ID certificate and notarization
-are configured.
+### Player and playlist
+
+The playlist stays attached to the player and moves with it. It contains playback details, selectable queue rows, and Clear and Close controls.
+
+![Player and playlist](docs/screens/player-playlist.png)
+
+### Context menu
+
+Right-click anywhere in the player or playlist to access transport, queue, volume, playback, size, window, and file actions. The player shifts upward when the menu would extend beyond the bottom of the screen.
+
+![Context menu](docs/screens/context-menu.png)
+
+### Waveform
+
+The waveform uses grey for played audio and white for upcoming audio, with a red playhead. Click or drag the waveform to seek.
+
+![Waveform](docs/screens/waveform.png)
 
 ## Controls
-Space play/pause · ←/→ seek 5 s · Shift+←/→ prev/next · ↑/↓ volume · M mute
-Drag on waveform to scrub · click waveform to jump · right-click waveform for the transport menu
-Progress ring (#ab4354) around the pill: click or drag it to seek, hover for elapsed / total time
-Right-click menu also has Playlist, Small / Medium / Big size, Minimize, Exit, Always on top and Lock position (size and the last two settings are remembered between launches, along with the window position)
-Window: drag the frame around the pill (or the gap inside the ring), or hold Alt/Option and drag anywhere. Size (small / medium / big) is in the right-click menu and is remembered.
-The playlist opens as a panel attached below the player; it moves with the player and rows select tracks.
-Drop files/folders to play · Shift+drop to append · hover waveform for track/format details
+
+| Action | Control |
+| --- | --- |
+| Play / pause | `Space` or the center button |
+| Seek | Click or drag the waveform |
+| Seek 5 seconds | `Left` / `Right` |
+| Previous / next track | `Shift` + `Left` / `Right` |
+| Volume | `Up` / `Down`, or the context-menu slider |
+| Mute | `M` or the context menu |
+| Move the player | Drag empty player space |
+| Add media | Drop files or folders; hold `Shift` to append |
+| Open options | Right-click anywhere in Haven |
+
+## Playlist
+
+Open **Playlist** from the context menu. The panel appears 5 px below the player and includes:
+
+- the playing track title, artist or format, and playback time;
+- every queued track with its title, artist, and duration;
+- an active-track highlight;
+- scroll support for longer queues;
+- **Clear**, which stops playback and empties the queue; and
+- **Close**, which hides the playlist without changing the queue.
+
+## Window and menu options
+
+The context menu contains:
+
+- Previous and Next
+- Playlist / Hide playlist
+- Volume and Mute
+- Shuffle
+- Repeat off, Repeat all, and Repeat one
+- Small, Medium, and Big sizes
+- Always on top
+- Lock position
+- Open files and Open folder
+- Minimize and Exit
+
+Haven saves the player size, position, Always on top state, and Lock position state in the platform application-data directory.
+
+## Download app
+
+### Check releases 
+
+Windows packaging produces an NSIS installer. macOS packaging produces a DMG. A macOS package must be signed and notarized with an Apple Developer ID before public distribution.
 
 ## Architecture
-```
-UI thread (egui)  ──Cmd (mpsc)──►  decoder thread  ──rtrb ring (~300 ms)──►  cpal callback
-      ▲                              symphonia                               pop + volume only
-      └──── Shared atomics (pos, dur, vol, flags) + TrackInfo ◄──────────────────┘
-waveform thread: decodes file once → 100 amplitude samples/s → RwLock<Vec<f32>> read by UI
-```
-Gapless: at EOF the decoder opens the next file and keeps writing into the same ring; the stream
-is only rebuilt when the sample rate changes.
 
-## Known gaps / next steps
-- WASAPI *exclusive* needs a dedicated backend (`wasapi` crate); cpal is shared-mode only. CoreAudio
-  hog-mode / device sample-rate switching: add via `coreaudio-rs`.
-- WavPack (.wv) and Monkey's Audio (.ape) aren't supported by symphonia → add an optional `ffmpeg-next` decoder behind a feature flag.
-- Frameless window has no native resize edges; add a grip using egui viewport commands, or use decorations on Windows.
-- Album art is read by lofty but not shown (design has no slot for it).
+```text
+egui UI ── commands ──► decoder thread ── lock-free audio ring ──► cpal output callback
+   ▲                         symphonia decoder                     pop + volume only
+   └──── shared playback state, track metadata, and waveform ◄──────────────────────┘
+```
+
+Waveform extraction runs in the background and produces 100 amplitude samples per second. The player preserves the audio stream between consecutive tracks where possible; it rebuilds the stream only when the output sample rate changes.
+
+## Current limits
+
+- Audio playback uses shared-mode system audio through cpal.
+- WavPack (`.wv`) and Monkey's Audio (`.ape`) are not decoded.
+- Album artwork is read from metadata but is not displayed in the current player design.
