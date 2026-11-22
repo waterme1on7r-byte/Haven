@@ -35,7 +35,8 @@ const MENU_HEIGHT: f32 = 250.0; // window room reserved for it
 const MENU_WIDTH: f32 = 200.0;
 const SCREEN_MARGIN: f32 = 56.0; // taskbar / Dock allowance at the screen bottom
 const PLAYLIST_HEIGHT: f32 = 270.0;
-const SETTINGS_HEIGHT: f32 = 340.0;
+const SETTINGS_HEIGHT: f32 = 376.0;
+const EQ_HEIGHT: f32 = 316.0;
 const PLAYLIST_GAP: f32 = 5.0;
 const HOVER_CARD_HEIGHT: f32 = 55.0;
 const CARD_SLOT: f32 = HOVER_CARD_HEIGHT + 4.0; // window room the card needs
@@ -52,11 +53,13 @@ pub struct Haven {
     pos_changed: Option<Instant>,
     playlist_open: bool,
     settings_open: bool,
-    panel_up: bool, // playlist/settings dock above the player instead of below
+    eq_open: bool,
+    eq_dirty: Option<Instant>, // EQ gains changed; saved shortly after the last change
+    panel_up: bool,            // playlist/settings dock above the player instead of below
     panel_was_open: bool,
     updater: crate::update::Updater,
     vol_dirty: Option<Instant>,
-    panel_applied: bool, // the last layout sent included a docked panel
+    panel_applied: bool,        // the last layout sent included a docked panel
     grow_sent: Option<Instant>, // upward growth: window enlarged, move still pending
     want_top: f32,
     // Context menu: anchored to the click, opens downward or upward.
@@ -66,7 +69,7 @@ pub struct Haven {
     menu_rect: Option<Rect>,
     menu_close: bool,
     menu_opened_at: Option<Instant>,
-    menu_applied: bool, // the last layout sent included room for the menu
+    menu_applied: bool,         // the last layout sent included room for the menu
     anchor: Option<egui::Pos2>, // player top-left in screen coordinates
     target_outer: Option<egui::Pos2>, // where the last layout command put the window
     minimize_pending: Option<Instant>,
@@ -82,6 +85,8 @@ pub struct Haven {
     top_pad: f32,
     req: [f32; 3], // last requested [top_pad, width, height]
     layout_until: Option<Instant>,
+    // Keep repainting briefly after input so play/pause state is never shown stale.
+    poll_until: Option<Instant>,
 }
 
 fn scan(paths: &[PathBuf]) -> Vec<PathBuf> {
@@ -199,7 +204,12 @@ fn fit(ctx: &egui::Context, text: &str, font: FontId, max_w: f32) -> String {
             hi = m - 1;
         }
     }
-    chars[..lo].iter().collect::<String>().trim_end().to_string() + "…"
+    chars[..lo]
+        .iter()
+        .collect::<String>()
+        .trim_end()
+        .to_string()
+        + "…"
 }
 
 fn fmt_time(s: f64) -> String {
@@ -219,6 +229,7 @@ impl Haven {
         if let Some(v) = settings.volume {
             engine.shared.set_vol(v); // restore the last used volume
         }
+        engine.shared.set_eq(settings.eq_on, settings.eq); // restore the equalizer
         let updater = crate::update::Updater::new();
         updater.auto_check(); // silent, at most once a day
         Self {
@@ -232,6 +243,8 @@ impl Haven {
             pos_changed: None,
             playlist_open: false,
             settings_open: false,
+            eq_open: false,
+            eq_dirty: None,
             panel_up: false,
             panel_was_open: false,
             updater,
@@ -259,6 +272,7 @@ impl Haven {
             top_pad: 0.0,
             req: [0.0, d[0], d[1]],
             layout_until: None,
+            poll_until: None,
         }
     }
 
@@ -352,7 +366,13 @@ impl Haven {
     }
 
     /// Round / rounded-square button face used by the Mini Mixer menu.
-    fn menu_btn(ui: &mut egui::Ui, rect: Rect, id: &str, active: bool, circle: bool) -> egui::Response {
+    fn menu_btn(
+        ui: &mut egui::Ui,
+        rect: Rect,
+        id: &str,
+        active: bool,
+        circle: bool,
+    ) -> egui::Response {
         let resp = ui
             .interact(rect, ui.id().with(id), Sense::click())
             .on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -360,7 +380,10 @@ impl Haven {
         let (fill, edge) = if active {
             (RED, RED)
         } else if resp.hovered() {
-            (Color32::from_rgb(0x2b, 0x2c, 0x2f), Color32::from_rgb(0x4a, 0x4b, 0x4f))
+            (
+                Color32::from_rgb(0x2b, 0x2c, 0x2f),
+                Color32::from_rgb(0x4a, 0x4b, 0x4f),
+            )
         } else {
             (BTN_FACE, PILL_EDGE)
         };
@@ -384,7 +407,10 @@ impl Haven {
             p.add(Shape::line(pts.iter().map(|q| pt(q.0, q.1)).collect(), st));
         };
         let closed = |pts: &[(f32, f32)]| {
-            p.add(Shape::closed_line(pts.iter().map(|q| pt(q.0, q.1)).collect(), st));
+            p.add(Shape::closed_line(
+                pts.iter().map(|q| pt(q.0, q.1)).collect(),
+                st,
+            ));
         };
         match kind {
             "prev" => {
@@ -415,7 +441,14 @@ impl Haven {
             }
             "vol" | "mute" => {
                 p.add(Shape::convex_polygon(
-                    vec![pt(-7.0, -2.5), pt(-3.5, -2.5), pt(1.0, -6.0), pt(1.0, 6.0), pt(-3.5, 2.5), pt(-7.0, 2.5)],
+                    vec![
+                        pt(-7.0, -2.5),
+                        pt(-3.5, -2.5),
+                        pt(1.0, -6.0),
+                        pt(1.0, 6.0),
+                        pt(-3.5, 2.5),
+                        pt(-7.0, 2.5),
+                    ],
                     col,
                     Stroke::NONE,
                 ));
@@ -438,10 +471,23 @@ impl Haven {
                 p.circle_filled(pt(3.0, 3.5), 2.4, col);
             }
             "file" => {
-                closed(&[(-5.0, -7.0), (1.5, -7.0), (5.5, -3.0), (5.5, 7.0), (-5.0, 7.0)]);
+                closed(&[
+                    (-5.0, -7.0),
+                    (1.5, -7.0),
+                    (5.5, -3.0),
+                    (5.5, 7.0),
+                    (-5.0, 7.0),
+                ]);
                 line(&[(1.5, -7.0), (1.5, -3.0), (5.5, -3.0)]);
             }
-            "fold" => closed(&[(-7.0, -4.5), (-2.0, -4.5), (0.0, -2.5), (7.0, -2.5), (7.0, 5.0), (-7.0, 5.0)]),
+            "fold" => closed(&[
+                (-7.0, -4.5),
+                (-2.0, -4.5),
+                (0.0, -2.5),
+                (7.0, -2.5),
+                (7.0, 5.0),
+                (-7.0, 5.0),
+            ]),
             "min" => line(&[(-6.0, 5.0), (6.0, 5.0)]),
             _ => {
                 // power
@@ -463,7 +509,11 @@ impl Haven {
         let sh = self.engine.shared.clone();
         let p = ui.painter().clone();
         let r = Rounding::same(18.0);
-        p.rect_filled(rect.translate(vec2(0.0, 3.0)), r, Color32::from_black_alpha(70));
+        p.rect_filled(
+            rect.translate(vec2(0.0, 3.0)),
+            r,
+            Color32::from_black_alpha(70),
+        );
         p.rect_filled(rect, r, PILL);
         p.rect_stroke(rect, r, Stroke::new(1.0, PILL_EDGE));
         let pad = 12.0;
@@ -487,7 +537,11 @@ impl Haven {
             &p,
             play.center(),
             if playing { "pause" } else { "play" },
-            if has_media { Color32::WHITE } else { Color32::from_gray(0x5c) },
+            if has_media {
+                Color32::WHITE
+            } else {
+                Color32::from_gray(0x5c)
+            },
         );
         if Self::menu_btn(ui, next, "next", false, false).clicked() {
             self.engine.next();
@@ -511,9 +565,16 @@ impl Haven {
         let fill_h = (fader.height() * vol).max(if vol > 0.0 { 12.0 } else { 0.0 });
         if fill_h > 0.0 {
             p.rect_filled(
-                Rect::from_min_max(pos2(fader.left(), fader.bottom() - fill_h), fader.right_bottom()),
+                Rect::from_min_max(
+                    pos2(fader.left(), fader.bottom() - fill_h),
+                    fader.right_bottom(),
+                ),
                 fr,
-                if muted { Color32::from_rgb(0x5a, 0x5b, 0x5e) } else { RED },
+                if muted {
+                    Color32::from_rgb(0x5a, 0x5b, 0x5e)
+                } else {
+                    RED
+                },
             );
         }
         // level read-out at the top of the fader
@@ -526,9 +587,16 @@ impl Haven {
                 format!("{}", (vol * 100.0).round() as i32)
             },
             FontId::proportional(10.5),
-            if vol > 0.88 && !muted { Color32::WHITE } else { Color32::from_gray(0xa0) },
+            if vol > 0.88 && !muted {
+                Color32::WHITE
+            } else {
+                Color32::from_gray(0xa0)
+            },
         );
-        let mute_zone = Rect::from_min_max(pos2(fader.left(), fader.bottom() - 30.0), fader.right_bottom());
+        let mute_zone = Rect::from_min_max(
+            pos2(fader.left(), fader.bottom() - 30.0),
+            fader.right_bottom(),
+        );
         Self::glyph(
             &p,
             mute_zone.center(),
@@ -586,6 +654,7 @@ impl Haven {
                         self.playlist_open = !self.playlist_open;
                         if self.playlist_open {
                             self.settings_open = false;
+                            self.eq_open = false;
                         }
                         self.menu_close = true;
                     }
@@ -610,11 +679,17 @@ impl Haven {
         for (i, (id, g, tip)) in foot.iter().enumerate() {
             let c = pos2(left + 16.0 + i as f32 * 36.0, foot_y);
             let br = Rect::from_center_size(c, vec2(32.0, 32.0));
-            let resp = Self::menu_btn(ui, br, id, i == 0 && self.settings_open, false)
-                .on_hover_text(*tip);
+            let resp = Self::menu_btn(
+                ui,
+                br,
+                id,
+                i == 0 && (self.settings_open || self.eq_open),
+                false,
+            )
+            .on_hover_text(*tip);
             let ink = if i == 4 {
                 RED
-            } else if i == 0 && self.settings_open {
+            } else if i == 0 && (self.settings_open || self.eq_open) {
                 Color32::WHITE
             } else {
                 ICON
@@ -626,14 +701,19 @@ impl Haven {
             if resp.clicked() {
                 match i {
                     0 => {
-                        self.settings_open = !self.settings_open;
+                        let open = self.settings_open || self.eq_open;
+                        self.settings_open = !open;
+                        self.eq_open = false;
                         if self.settings_open {
                             self.playlist_open = false;
                         }
                         self.menu_close = true;
                     }
                     1 => {
-                        if let Some(f) = rfd::FileDialog::new().add_filter("Audio", EXTS).pick_files() {
+                        if let Some(f) = rfd::FileDialog::new()
+                            .add_filter("Audio", EXTS)
+                            .pick_files()
+                        {
                             self.open(f, true);
                         }
                         self.menu_close = true;
@@ -661,6 +741,7 @@ impl Haven {
         let pos = sh.pos_ms.load(Relaxed) as f64 / 1000.0;
         let dur = sh.dur_ms.load(Relaxed) as f64 / 1000.0;
         let has_media = !sh.queue_info.lock().unwrap().is_empty();
+        let mut toggle_eq = false;
         ctx.input_mut(|i| {
             if i.consume_key(Modifiers::NONE, Key::Space) && has_media {
                 self.engine.toggle();
@@ -686,7 +767,14 @@ impl Haven {
             if i.consume_key(Modifiers::NONE, Key::M) {
                 sh.muted.store(!sh.muted.load(Relaxed), Relaxed);
             }
+            if i.consume_key(Modifiers::NONE, Key::E) {
+                toggle_eq = true;
+            }
         });
+        if toggle_eq {
+            self.settings.eq_on = !self.settings.eq_on;
+            self.push_eq();
+        }
         let dropped = ctx.input(|i| {
             i.raw
                 .dropped_files
@@ -804,7 +892,10 @@ impl Haven {
             }
         }
         if wresp.clicked() {
-            if let Some(pt) = wresp.interact_pointer_pos().filter(|pt| (pt.x - cx).abs() > 4.0) {
+            if let Some(pt) = wresp
+                .interact_pointer_pos()
+                .filter(|pt| (pt.x - cx).abs() > 4.0)
+            {
                 self.engine
                     .seek((real_pos + ((pt.x - cx) / pitch) as f64 * SECS_PER_BAR).clamp(0.0, dur));
             }
@@ -870,8 +961,16 @@ impl Haven {
         }
 
         // ---- button ----
-        let hot = if has_media && btn.hovered() { 1.15 } else { 1.0 };
-        let icon_col = if has_media { ICON } else { ICON.gamma_multiply(0.3) };
+        let hot = if has_media && btn.hovered() {
+            1.15
+        } else {
+            1.0
+        };
+        let icon_col = if has_media {
+            ICON
+        } else {
+            ICON.gamma_multiply(0.3)
+        };
         p.circle(
             bc,
             r,
@@ -910,7 +1009,6 @@ impl Haven {
 
         // ---- waveform: five styles (centered playhead, audio scrolls underneath) ----
         let posbar = pos / SECS_PER_BAR;
-        let animation_time = ctx.input(|i| i.time);
         let half = (well.width() / 2.0 / pitch).ceil() as i64 + 2;
         let c0 = posbar.floor() as i64;
         let mid = well.center().y;
@@ -947,31 +1045,28 @@ impl Haven {
             };
 
             if style == 4 {
-                // Scope: a continuous line with a carrier, like a zoomed-in waveform.
+                // Wave: one clean sine. Its height follows a smoothed loudness
+                // envelope and its phase is tied to track time, so it scrolls
+                // with the audio. No noise term, so the line stays smooth.
+                let wl = (pitch * 4.2) as f64; // wavelength in px
                 let mut pts: Vec<egui::Pos2> = Vec::new();
                 let mut split = 0usize;
                 let mut x = well.left();
-                while x <= well.right() + 2.0 {
+                while x <= well.right() + 1.5 {
                     let tb = posbar + ((x - cx) / pitch) as f64;
                     let t = tb * SECS_PER_BAR;
                     let mut y = mid;
                     if t >= 0.0 && (dur <= 0.0 || t <= dur) {
-                        let (core, halo) = level(t - SECS_PER_BAR * 0.5, t + SECS_PER_BAR * 0.5);
-                        let amp = (core * 0.7 + halo * 0.3).min(1.0);
-                        let ph = tb as f32 * pitch * 1.15;
-                        let k = (tb * (pitch as f64 / 2.0)) as i64 as u64;
-                        let noise = ((k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) as f32
-                            / 16_777_216.0
-                            - 0.5)
-                            * 0.7;
-                        let w = 0.55 * ph.sin() + 0.25 * (ph * 2.31 + 1.1).sin() + noise;
-                        y = mid - w.clamp(-1.0, 1.0) * amp * maxh * 0.5;
+                        let (core, halo) = level(t - 0.30, t + 0.30);
+                        let amp = 0.06 + 0.94 * (core * 0.75 + halo * 0.25).min(1.0);
+                        let ph = ((tb * pitch as f64 / wl) % 1.0) as f32 * std::f32::consts::TAU;
+                        y = mid - ph.sin() * amp * maxh * 0.48;
                     }
                     if x < cx {
                         split = pts.len() + 1;
                     }
                     pts.push(pos2(x, y));
-                    x += 2.0;
+                    x += 1.5;
                 }
                 let split = split.min(pts.len());
                 let (past, fut) = pts.split_at(split.max(1).min(pts.len()));
@@ -984,16 +1079,19 @@ impl Haven {
                 if past.len() > 1 {
                     wp.add(Shape::line(
                         past.clone(),
-                        Stroke::new(3.4, Color32::from_gray(0x5a).gamma_multiply(0.16)),
+                        Stroke::new(4.0, Color32::from_gray(0x5a).gamma_multiply(0.14)),
                     ));
-                    wp.add(Shape::line(past, Stroke::new(1.5, Color32::from_gray(0x78))));
+                    wp.add(Shape::line(
+                        past,
+                        Stroke::new(1.8, Color32::from_gray(0x78)),
+                    ));
                 }
                 if fut.len() > 1 {
                     wp.add(Shape::line(
                         fut.clone(),
-                        Stroke::new(3.4, BAR_FUTURE.gamma_multiply(0.16)),
+                        Stroke::new(4.0, BAR_FUTURE.gamma_multiply(0.14)),
                     ));
-                    wp.add(Shape::line(fut, Stroke::new(1.5, BAR_FUTURE)));
+                    wp.add(Shape::line(fut, Stroke::new(1.8, BAR_FUTURE)));
                 }
             } else {
                 for i in (c0 - half)..=(c0 + half) {
@@ -1002,20 +1100,6 @@ impl Haven {
                         continue;
                     }
                     let x = cx + (i as f64 - posbar) as f32 * pitch;
-                    // Stable pseudo-random choice: a few future bars gently swell.
-                    let hash = (i as u64)
-                        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                        .wrapping_add(self.seen_gen.wrapping_mul(0xBF58_476D_1CE4_E5B9));
-                    let over_remaining_label = x >= well.right() - 68.0;
-                    let animate = x > cx && !over_remaining_label && hash % 7 == 0;
-                    let phase = ((hash >> 16) % 6283) as f64 / 1000.0;
-                    let swell = if animate {
-                        1.0 + 0.22
-                            * ((animation_time * std::f64::consts::TAU / 18.0 + phase).sin() * 0.5
-                                + 0.5) as f32
-                    } else {
-                        1.0
-                    };
                     let played = x < cx;
                     let fade = ((well.right() - x) / (well.width() * 0.5)).clamp(0.35, 1.0);
                     let ink = |future: Color32, past: u8| -> Color32 {
@@ -1026,8 +1110,6 @@ impl Haven {
                         }
                     };
                     let (core, halo) = level(t, t + SECS_PER_BAR);
-                    let core = (core * swell).min(1.0);
-                    let halo = (halo * swell).min(1.0);
                     match style {
                         0 => {
                             // Pulse: peak halo around a bright RMS core.
@@ -1051,7 +1133,7 @@ impl Haven {
                             for sidx in 0..2 {
                                 let ts = t + SECS_PER_BAR * 0.5 * sidx as f64;
                                 let (c, hl) = level(ts, ts + SECS_PER_BAR * 0.5);
-                                let hh = (bw * 2.0 + (hl * swell).min(1.0) * maxh).min(maxh);
+                                let hh = (bw * 2.0 + hl * maxh).min(maxh);
                                 let xs = x + (sidx as f32 - 0.5) * pitch * 0.5;
                                 let col = ink(BAR_FUTURE.gamma_multiply(0.55 + 0.45 * c), 0x62);
                                 wp.rect_filled(
@@ -1065,21 +1147,42 @@ impl Haven {
                             }
                         }
                         2 => {
-                            // Skyline: single bars growing from a baseline. No reflection:
-                            // the mirrored copy read as a doubled / shuttered image.
+                            // Skyline: round-topped bars standing on a baseline, with a
+                            // short faded reflection underneath.
                             let bw = pitch * 0.30;
-                            let base = well.top() + well.height() * 0.70;
-                            let up = (bw + halo * maxh * 0.80).min(well.height() * 0.64);
+                            let base = well.top() + well.height() * 0.60;
+                            let full_h = well.height() * 0.44;
+                            let up = (bw + (0.22 + 0.78 * halo) * full_h).min(full_h);
+                            let col = ink(BAR_FUTURE, 0x62);
                             wp.rect_filled(
-                                Rect::from_min_max(pos2(x - bw / 2.0, base - up), pos2(x + bw / 2.0, base)),
+                                Rect::from_min_max(
+                                    pos2(x - bw / 2.0, base - up),
+                                    pos2(x + bw / 2.0, base),
+                                ),
                                 Rounding {
                                     nw: bw / 2.0,
                                     ne: bw / 2.0,
-                                    sw: bw / 2.0,
-                                    se: bw / 2.0,
+                                    sw: 0.0,
+                                    se: 0.0,
                                 },
-                                ink(BAR_FUTURE, 0x62),
+                                col,
                             );
+                            let rtop = base + 2.0;
+                            let rh = up * 0.36;
+                            let mut m = egui::epaint::Mesh::default();
+                            m.colored_vertex(pos2(x - bw / 2.0, rtop), col.gamma_multiply(0.34));
+                            m.colored_vertex(pos2(x + bw / 2.0, rtop), col.gamma_multiply(0.34));
+                            m.colored_vertex(
+                                pos2(x + bw / 2.0, rtop + rh),
+                                col.gamma_multiply(0.04),
+                            );
+                            m.colored_vertex(
+                                pos2(x - bw / 2.0, rtop + rh),
+                                col.gamma_multiply(0.04),
+                            );
+                            m.add_triangle(0, 1, 2);
+                            m.add_triangle(0, 2, 3);
+                            wp.add(Shape::mesh(m));
                         }
                         _ => {
                             // Segments: stacked LED-style blocks, mirrored around the middle.
@@ -1097,7 +1200,10 @@ impl Haven {
                                     .gamma_multiply(if played { a } else { 1.0 });
                                 for sg in [-1.0f32, 1.0] {
                                     wp.rect_filled(
-                                        Rect::from_center_size(pos2(x, mid + sg * dy), vec2(sw, seg)),
+                                        Rect::from_center_size(
+                                            pos2(x, mid + sg * dy),
+                                            vec2(sw, seg),
+                                        ),
                                         sw * 0.35,
                                         col,
                                     );
@@ -1138,8 +1244,6 @@ impl Haven {
             RED,
             Stroke::NONE,
         ));
-
-
 
         // brief volume read-out after a wheel scroll
         if let Some(t) = self.vol_flash {
@@ -1440,25 +1544,48 @@ impl Haven {
             Align2::LEFT_CENTER,
             label,
             FontId::proportional(13.0),
-            if resp.hovered() { Color32::WHITE } else { Color32::from_gray(0xe0) },
+            if resp.hovered() {
+                Color32::WHITE
+            } else {
+                Color32::from_gray(0xe0)
+            },
         );
         let track = Rect::from_center_size(row.right_center() - vec2(17.0, 0.0), vec2(34.0, 18.0));
         p.rect_filled(
             track,
             Rounding::same(9.0),
-            if on { RED } else { Color32::from_rgb(0x3a, 0x3b, 0x3e) },
+            if on {
+                RED
+            } else {
+                Color32::from_rgb(0x3a, 0x3b, 0x3e)
+            },
         );
-        let kx = if on { track.right() - 9.0 } else { track.left() + 9.0 };
+        let kx = if on {
+            track.right() - 9.0
+        } else {
+            track.left() + 9.0
+        };
         p.circle_filled(
             pos2(kx, track.center().y),
             7.0,
-            if on { Color32::WHITE } else { Color32::from_gray(0x9a) },
+            if on {
+                Color32::WHITE
+            } else {
+                Color32::from_gray(0x9a)
+            },
         );
         resp.clicked()
     }
 
     /// Small text button used in the settings drawer.
-    fn pill_button(ui: &mut egui::Ui, rect: Rect, id: &str, text: &str, primary: bool, enabled: bool) -> bool {
+    fn pill_button(
+        ui: &mut egui::Ui,
+        rect: Rect,
+        id: &str,
+        text: &str,
+        primary: bool,
+        enabled: bool,
+    ) -> bool {
         let resp = ui.interact(rect, ui.id().with(id), Sense::click());
         let resp = if enabled {
             resp.on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -1466,16 +1593,35 @@ impl Haven {
             resp
         };
         let (fill, ink) = if !enabled {
-            (Color32::from_rgb(0x1f, 0x20, 0x22), Color32::from_gray(0x6a))
+            (
+                Color32::from_rgb(0x1f, 0x20, 0x22),
+                Color32::from_gray(0x6a),
+            )
         } else if primary {
-            (if resp.hovered() { Color32::from_rgb(0xe0, 0x5c, 0x6a) } else { RED }, Color32::WHITE)
+            (
+                if resp.hovered() {
+                    Color32::from_rgb(0xe0, 0x5c, 0x6a)
+                } else {
+                    RED
+                },
+                Color32::WHITE,
+            )
         } else if resp.hovered() {
             (Color32::from_rgb(0x3a, 0x3b, 0x3e), Color32::WHITE)
         } else {
-            (Color32::from_rgb(0x2f, 0x30, 0x33), Color32::from_gray(0xe0))
+            (
+                Color32::from_rgb(0x2f, 0x30, 0x33),
+                Color32::from_gray(0xe0),
+            )
         };
         ui.painter().rect_filled(rect, Rounding::same(10.0), fill);
-        ui.painter().text(rect.center(), Align2::CENTER_CENTER, text, FontId::proportional(12.0), ink);
+        ui.painter().text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            text,
+            FontId::proportional(12.0),
+            ink,
+        );
         enabled && resp.clicked()
     }
 
@@ -1491,24 +1637,46 @@ impl Haven {
             0 => {
                 for (i, v) in H.iter().enumerate() {
                     let x = left + (i as f32 + 0.5) * aw / 7.0;
-                    p.rect_filled(Rect::from_center_size(pos2(x, cy), vec2(3.0, v * maxh)), 1.5, ink);
+                    p.rect_filled(
+                        Rect::from_center_size(pos2(x, cy), vec2(3.0, v * maxh)),
+                        1.5,
+                        ink,
+                    );
                 }
             }
             1 => {
                 for i in 0..12 {
                     let v = 0.25 + 0.75 * (i as f32 * 1.7).sin().abs();
                     let x = left + (i as f32 + 0.5) * aw / 12.0;
-                    p.rect_filled(Rect::from_center_size(pos2(x, cy), vec2(1.2, v * maxh)), 0.6, ink);
+                    p.rect_filled(
+                        Rect::from_center_size(pos2(x, cy), vec2(1.2, v * maxh)),
+                        0.6,
+                        ink,
+                    );
                 }
             }
             2 => {
-                let base = cy + maxh / 2.0;
+                let base = cy + maxh * 0.18;
                 for (i, v) in H.iter().enumerate() {
                     let x = left + (i as f32 + 0.5) * aw / 7.0;
+                    let hh = v * maxh * 0.78;
                     p.rect_filled(
-                        Rect::from_min_max(pos2(x - 1.5, base - v * maxh), pos2(x + 1.5, base)),
-                        1.5,
+                        Rect::from_min_max(pos2(x - 1.5, base - hh), pos2(x + 1.5, base)),
+                        Rounding {
+                            nw: 1.5,
+                            ne: 1.5,
+                            sw: 0.0,
+                            se: 0.0,
+                        },
                         ink,
+                    );
+                    p.rect_filled(
+                        Rect::from_min_max(
+                            pos2(x - 1.5, base + 1.5),
+                            pos2(x + 1.5, base + 1.5 + hh * 0.34),
+                        ),
+                        0.0,
+                        ink.gamma_multiply(0.22),
                     );
                 }
             }
@@ -1518,7 +1686,10 @@ impl Haven {
                     for k in 0..((v * 4.0).round() as i32) {
                         for sg in [-1.0f32, 1.0] {
                             p.rect_filled(
-                                Rect::from_center_size(pos2(x, cy + sg * k as f32 * 3.4), vec2(3.0, 2.0)),
+                                Rect::from_center_size(
+                                    pos2(x, cy + sg * k as f32 * 3.4),
+                                    vec2(3.0, 2.0),
+                                ),
                                 0.8,
                                 ink,
                             );
@@ -1530,7 +1701,10 @@ impl Haven {
                 let pts: Vec<egui::Pos2> = (0..=24)
                     .map(|i| {
                         let t = i as f32 / 24.0;
-                        pos2(left + t * aw, cy - (t * std::f32::consts::TAU * 2.5).sin() * maxh * 0.45)
+                        pos2(
+                            left + t * aw,
+                            cy - (t * std::f32::consts::TAU * 2.5).sin() * maxh * 0.45,
+                        )
                     })
                     .collect();
                 p.add(Shape::line(pts, Stroke::new(1.4, ink)));
@@ -1568,13 +1742,19 @@ impl Haven {
         let (fill, ink) = if close_resp.hovered() {
             (Color32::from_rgb(0x43, 0x23, 0x2a), RED)
         } else {
-            (Color32::from_rgb(0x18, 0x19, 0x1a), Color32::from_gray(0xc8))
+            (
+                Color32::from_rgb(0x18, 0x19, 0x1a),
+                Color32::from_gray(0xc8),
+            )
         };
         painter.rect_filled(close, Rounding::same(10.0), fill);
         painter.rect_stroke(close, Rounding::same(10.0), Stroke::new(1.0, PILL_EDGE));
         for (a, b) in [((-4.0, -4.0), (4.0, 4.0)), ((4.0, -4.0), (-4.0, 4.0))] {
             painter.line_segment(
-                [close.center() + vec2(a.0, a.1), close.center() + vec2(b.0, b.1)],
+                [
+                    close.center() + vec2(a.0, a.1),
+                    close.center() + vec2(b.0, b.1),
+                ],
                 Stroke::new(1.8, ink),
             );
         }
@@ -1600,13 +1780,14 @@ impl Haven {
         if Self::switch_row(ui, r1, "on-top", "Always on top", self.settings.on_top) {
             self.settings.on_top = !self.settings.on_top;
             self.settings.save();
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::WindowLevel(
-                if self.settings.on_top {
-                    egui::WindowLevel::AlwaysOnTop
-                } else {
-                    egui::WindowLevel::Normal
-                },
-            ));
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                    if self.settings.on_top {
+                        egui::WindowLevel::AlwaysOnTop
+                    } else {
+                        egui::WindowLevel::Normal
+                    },
+                ));
         }
         y += row_h;
         let r2 = Rect::from_min_size(pos2(left, y), vec2(right - left, row_h));
@@ -1638,7 +1819,11 @@ impl Haven {
                 .on_hover_cursor(egui::CursorIcon::PointingHand);
             let active = self.settings.size == n;
             if active {
-                painter.rect_filled(cell, Rounding::same(8.0), Color32::from_rgb(0x3a, 0x3b, 0x3e));
+                painter.rect_filled(
+                    cell,
+                    Rounding::same(8.0),
+                    Color32::from_rgb(0x3a, 0x3b, 0x3e),
+                );
             }
             painter.text(
                 cell.center(),
@@ -1657,6 +1842,51 @@ impl Haven {
                 self.settings.size = n;
                 self.settings.save();
             }
+        }
+        y += row_h;
+        let r_eq = Rect::from_min_size(pos2(left, y), vec2(right - left, row_h));
+        let eq_resp = ui
+            .interact(r_eq, ui.id().with("eq-row"), Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        painter.text(
+            r_eq.left_center(),
+            Align2::LEFT_CENTER,
+            "Equalizer",
+            FontId::proportional(13.0),
+            if eq_resp.hovered() {
+                Color32::WHITE
+            } else {
+                Color32::from_gray(0xe0)
+            },
+        );
+        let chev = r_eq.right_center() - vec2(8.0, 0.0);
+        let chev_ink = if eq_resp.hovered() {
+            Color32::WHITE
+        } else {
+            Color32::from_gray(0x9a)
+        };
+        painter.line_segment(
+            [chev + vec2(-3.0, -5.0), chev + vec2(2.0, 0.0)],
+            Stroke::new(1.6, chev_ink),
+        );
+        painter.line_segment(
+            [chev + vec2(2.0, 0.0), chev + vec2(-3.0, 5.0)],
+            Stroke::new(1.6, chev_ink),
+        );
+        painter.text(
+            chev - vec2(14.0, 0.0),
+            Align2::RIGHT_CENTER,
+            if self.settings.eq_on { "On" } else { "Off" },
+            FontId::proportional(12.0),
+            if self.settings.eq_on {
+                RED
+            } else {
+                Color32::from_gray(0x8d)
+            },
+        );
+        if eq_resp.clicked() {
+            self.settings_open = false;
+            self.eq_open = true; // same slot, the player does not move
         }
         y += row_h + 6.0;
 
@@ -1689,13 +1919,29 @@ impl Haven {
         let r4 = Rect::from_min_size(pos2(left, y), vec2(right - left, row_h));
         let st = self.updater.snapshot();
         let (text, hot, btn, primary, enabled): (String, bool, &str, bool, bool) = match &st {
-            State::Idle => (format!("Haven v{}", Updater::current()), false, "Check", false, true),
+            State::Idle => (
+                format!("Haven v{}", Updater::current()),
+                false,
+                "Check",
+                false,
+                true,
+            ),
             State::Checking => ("Checking for updates…".into(), false, "…", false, false),
-            State::UpToDate => (format!("v{} · up to date", Updater::current()), false, "Check", false, true),
+            State::UpToDate => (
+                format!("v{} · up to date", Updater::current()),
+                false,
+                "Check",
+                false,
+                true,
+            ),
             State::Available(r) => (
                 format!("Version {} is available", r.version),
                 true,
-                if r.asset_url.is_some() { "Download" } else { "Open page" },
+                if r.asset_url.is_some() {
+                    "Download"
+                } else {
+                    "Open page"
+                },
                 true,
                 true,
             ),
@@ -1710,13 +1956,30 @@ impl Haven {
                 false,
                 false,
             ),
-            State::Downloaded(_) => ("Installer opened — quit Haven to finish".into(), true, "Open", false, true),
-            State::Failed(_) => ("Couldn't check for updates".into(), false, "Retry", false, true),
+            State::Downloaded(_) => (
+                "Installer opened — quit Haven to finish".into(),
+                true,
+                "Open",
+                false,
+                true,
+            ),
+            State::Failed(_) => (
+                "Couldn't check for updates".into(),
+                false,
+                "Retry",
+                false,
+                true,
+            ),
         };
         painter.text(
             r4.left_center(),
             Align2::LEFT_CENTER,
-            fit(ui.ctx(), &text, FontId::proportional(12.0), r4.width() - 108.0),
+            fit(
+                ui.ctx(),
+                &text,
+                FontId::proportional(12.0),
+                r4.width() - 108.0,
+            ),
             FontId::proportional(12.0),
             if hot { RED } else { Color32::from_gray(0xb4) },
         );
@@ -1730,14 +1993,298 @@ impl Haven {
         }
     }
 
+    /// Sends the equalizer state to the audio thread and schedules a save.
+    fn push_eq(&mut self) {
+        self.engine
+            .shared
+            .set_eq(self.settings.eq_on, self.settings.eq);
+        self.eq_dirty = Some(Instant::now());
+    }
+
+    /// Equalizer drawer: ten faders (+/-12 dB), docked exactly like Settings.
+    fn draw_eq(&mut self, ui: &mut egui::Ui) {
+        let rect = ui.max_rect();
+        let painter = ui.painter().clone();
+        let outer = Rounding::same(22.0);
+        painter.rect_filled(rect.shrink(8.0), outer, PILL);
+        painter.rect_stroke(rect.shrink(8.0), outer, Stroke::new(1.0, PILL_EDGE));
+        let (left, right) = (rect.left() + 27.0, rect.right() - 27.0);
+
+        let header = Rect::from_min_max(
+            pos2(left, rect.top() + 13.0),
+            pos2(right, rect.top() + 43.0),
+        );
+        painter.text(
+            header.left_center(),
+            Align2::LEFT_CENTER,
+            "Equalizer",
+            FontId::proportional(16.0),
+            Color32::from_gray(0xe6),
+        );
+        // close: back to Settings
+        let close = Rect::from_center_size(
+            pos2(header.right() - 8.0, header.center().y),
+            vec2(31.0, 31.0),
+        );
+        let close_resp = ui
+            .interact(close, ui.id().with("eq-close"), Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        let (fill, ink) = if close_resp.hovered() {
+            (Color32::from_rgb(0x43, 0x23, 0x2a), RED)
+        } else {
+            (
+                Color32::from_rgb(0x18, 0x19, 0x1a),
+                Color32::from_gray(0xc8),
+            )
+        };
+        painter.rect_filled(close, Rounding::same(10.0), fill);
+        painter.rect_stroke(close, Rounding::same(10.0), Stroke::new(1.0, PILL_EDGE));
+        for (a, b) in [((-4.0, -4.0), (4.0, 4.0)), ((4.0, -4.0), (-4.0, 4.0))] {
+            painter.line_segment(
+                [
+                    close.center() + vec2(a.0, a.1),
+                    close.center() + vec2(b.0, b.1),
+                ],
+                Stroke::new(1.8, ink),
+            );
+        }
+        if close_resp.clicked() {
+            self.eq_open = false;
+            self.settings_open = true;
+        }
+        // on / off switch
+        let on = self.settings.eq_on;
+        let track = Rect::from_center_size(
+            pos2(close.left() - 12.0 - 17.0, header.center().y),
+            vec2(34.0, 18.0),
+        );
+        let sresp = ui
+            .interact(
+                track.expand2(vec2(6.0, 8.0)),
+                ui.id().with("eq-onoff"),
+                Sense::click(),
+            )
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        painter.rect_filled(
+            track,
+            Rounding::same(9.0),
+            if on {
+                RED
+            } else {
+                Color32::from_rgb(0x3a, 0x3b, 0x3e)
+            },
+        );
+        let kx = if on {
+            track.right() - 9.0
+        } else {
+            track.left() + 9.0
+        };
+        painter.circle_filled(
+            pos2(kx, track.center().y),
+            7.0,
+            if on {
+                Color32::WHITE
+            } else {
+                Color32::from_gray(0x9a)
+            },
+        );
+        if sresp.clicked() {
+            self.settings.eq_on = !self.settings.eq_on;
+            self.push_eq();
+        }
+
+        // presets
+        let presets: [(&str, [f32; 10]); 4] = [
+            ("Flat", [0.0; 10]),
+            ("Bass", [6.0, 5.0, 4.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            (
+                "Vocal",
+                [-2.0, -2.0, -1.0, 0.0, 2.0, 3.0, 3.0, 2.0, 0.0, -1.0],
+            ),
+            ("Treble", [0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 4.0, 5.0, 6.0]),
+        ];
+        let cur = self.settings.eq;
+        let matched = presets
+            .iter()
+            .position(|(_, g)| g.iter().zip(cur.iter()).all(|(a, b)| (a - b).abs() < 0.05));
+        let gap = 6.0;
+        let cw = ((right - left) - gap * 4.0) / 5.0;
+        for n in 0..5usize {
+            let chip = Rect::from_min_size(
+                pos2(left + n as f32 * (cw + gap), rect.top() + 52.0),
+                vec2(cw, 26.0),
+            );
+            let resp = ui.interact(chip, ui.id().with(("eq-preset", n)), Sense::click());
+            let resp = if n < 4 {
+                resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+            } else {
+                resp
+            };
+            let (name, active) = if n < 4 {
+                (presets[n].0, matched == Some(n))
+            } else {
+                ("Custom", matched.is_none())
+            };
+            painter.rect_filled(
+                chip,
+                Rounding::same(13.0),
+                Color32::from_rgb(0x20, 0x21, 0x23),
+            );
+            painter.rect_stroke(
+                chip,
+                Rounding::same(13.0),
+                Stroke::new(1.0, if active { RED } else { PILL_EDGE }),
+            );
+            painter.text(
+                chip.center(),
+                Align2::CENTER_CENTER,
+                name,
+                FontId::proportional(11.0),
+                if active {
+                    Color32::WHITE
+                } else {
+                    Color32::from_gray(0xc0)
+                },
+            );
+            if n < 4 && resp.clicked() {
+                self.settings.eq = presets[n].1;
+                if n > 0 {
+                    self.settings.eq_on = true;
+                }
+                self.push_eq();
+            }
+        }
+
+        // faders
+        let well = Rect::from_min_max(
+            pos2(left, rect.top() + 88.0),
+            pos2(right, rect.top() + 296.0),
+        );
+        painter.rect_filled(well, Rounding::same(14.0), WELL);
+        painter.rect_stroke(well, Rounding::same(14.0), Stroke::new(1.0, WELL_EDGE));
+        let (tt, tb) = (well.top() + 28.0, well.bottom() - 28.0);
+        let mid = (tt + tb) / 2.0;
+        let half = (tb - tt) / 2.0;
+        painter.line_segment(
+            [
+                pos2(well.left() + 10.0, mid),
+                pos2(well.right() - 10.0, mid),
+            ],
+            Stroke::new(1.0, Color32::from_rgb(0x3a, 0x3b, 0x3e)),
+        );
+        let on = self.settings.eq_on;
+        let dim = if on { 1.0 } else { 0.45 };
+        let short = [
+            "32", "64", "125", "250", "500", "1k", "2k", "4k", "8k", "16k",
+        ];
+        let long = [
+            "32 Hz", "64 Hz", "125 Hz", "250 Hz", "500 Hz", "1 kHz", "2 kHz", "4 kHz", "8 kHz",
+            "16 kHz",
+        ];
+        let col_w = (well.width() - 16.0) / 10.0;
+        let mut readout: Option<usize> = None;
+        for i in 0..10usize {
+            let cx = well.left() + 8.0 + (i as f32 + 0.5) * col_w;
+            let col = Rect::from_min_max(
+                pos2(cx - col_w / 2.0, tt - 12.0),
+                pos2(cx + col_w / 2.0, tb + 12.0),
+            );
+            let resp = ui
+                .interact(col, ui.id().with(("eq-band", i)), Sense::click_and_drag())
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            let mut g = self.settings.eq[i];
+            if resp.dragged() || resp.clicked() {
+                if let Some(pt) = resp.interact_pointer_pos() {
+                    let v = ((mid - pt.y) / half * 12.0).clamp(-12.0, 12.0);
+                    let v = (v * 2.0).round() / 2.0; // half-dB steps
+                    g = if v.abs() < 0.5 { 0.0 } else { v };
+                }
+            }
+            if resp.double_clicked() {
+                g = 0.0;
+            }
+            if resp.hovered() {
+                let dy = ui.ctx().input(|inp| inp.smooth_scroll_delta.y);
+                if dy.abs() > 0.01 {
+                    g = (((g + dy * 0.012).clamp(-12.0, 12.0)) * 10.0).round() / 10.0;
+                }
+            }
+            if (g - self.settings.eq[i]).abs() > 1e-4 {
+                self.settings.eq[i] = g;
+                self.push_eq();
+            }
+            if resp.hovered() || resp.dragged() {
+                readout = Some(i);
+            }
+            let g = self.settings.eq[i];
+            let y = mid - g / 12.0 * half;
+            painter.line_segment(
+                [pos2(cx, tt), pos2(cx, tb)],
+                Stroke::new(2.0, Color32::from_rgb(0x3a, 0x3b, 0x3e)),
+            );
+            painter.line_segment(
+                [pos2(cx, mid), pos2(cx, y)],
+                Stroke::new(2.0, RED.gamma_multiply(dim)),
+            );
+            painter.circle(
+                pos2(cx, y),
+                7.0,
+                Color32::from_gray(0xe4).gamma_multiply(dim),
+                Stroke::new(2.0, WELL),
+            );
+            painter.text(
+                pos2(cx, well.bottom() - 13.0),
+                Align2::CENTER_CENTER,
+                short[i],
+                FontId::proportional(9.5),
+                Color32::from_gray(0x9a),
+            );
+        }
+        let (txt, ink) = match readout {
+            Some(i) => (
+                format!("{}   {:+.1} dB", long[i], self.settings.eq[i]),
+                Color32::from_gray(0xe0),
+            ),
+            None => (
+                "\u{b1}12 dB \u{b7} double-click resets a band".to_string(),
+                Color32::from_gray(0x82),
+            ),
+        };
+        painter.text(
+            pos2(well.center().x, well.top() + 14.0),
+            Align2::CENTER_CENTER,
+            txt,
+            FontId::proportional(10.5),
+            ink,
+        );
+    }
+
+    /// Height of the docked Playlist / Settings / Equalizer panel including its gap (0 if none).
+    fn panel_total(&self) -> f32 {
+        if self.playlist_open {
+            PLAYLIST_HEIGHT + PLAYLIST_GAP
+        } else if self.settings_open {
+            SETTINGS_HEIGHT + PLAYLIST_GAP
+        } else if self.eq_open {
+            EQ_HEIGHT + PLAYLIST_GAP
+        } else {
+            0.0
+        }
+    }
+
+    /// The hover card sits above the player, or above the panel when the panel
+    /// is docked upward, so it never covers (or hangs off the screen below) them.
     fn card_rect(&self, player: Rect, dims: [f32; 2], base_h: f32) -> Rect {
         let inset = dims[1] * 0.124; // same side inset as the pill
         let (l, r) = (player.left() + inset, player.right() - inset);
         if self.card_above {
-            Rect::from_min_max(
-                pos2(l, player.top() - HOVER_CARD_HEIGHT - 2.0),
-                pos2(r, player.top() - 2.0),
-            )
+            let up = if self.panel_up {
+                self.panel_total()
+            } else {
+                0.0
+            };
+            let bottom = player.top() - up - 2.0;
+            Rect::from_min_max(pos2(l, bottom - HOVER_CARD_HEIGHT), pos2(r, bottom))
         } else {
             let y = player.top() + base_h + 2.0;
             Rect::from_min_max(pos2(l, y), pos2(r, y + HOVER_CARD_HEIGHT))
@@ -1824,14 +2371,34 @@ impl Haven {
                 }
             }
         } else if !self.card_suppressed && self.menu_rel.is_none() && self.info.is_some() {
-            let outer = ctx.input(|i| i.viewport().outer_rect);
-            // Prefer above the app; go below if the screen has no room above.
-            let panel_open = self.playlist_open || self.settings_open;
-            self.card_above = if panel_open && self.panel_up {
-                false
+            let (outer, monitor) = ctx.input(|i| {
+                let v = i.viewport();
+                (v.outer_rect, v.monitor_size)
+            });
+            // Prefer above the player (above the panel when it is docked upward);
+            // go below only if there is room on screen, otherwise skip the card.
+            let up = if self.panel_up {
+                self.panel_total()
             } else {
-                outer.map_or(true, |o| o.min.y + self.top_pad >= CARD_SLOT + 8.0)
+                0.0
             };
+            let ptop = outer.map(|o| o.min.y + self.top_pad);
+            let room_above = ptop.map_or(true, |y| y - up >= CARD_SLOT + 8.0);
+            let room_below = match (ptop, monitor) {
+                (Some(y), Some(m)) => {
+                    let below_panel = if self.panel_up {
+                        0.0
+                    } else {
+                        self.panel_total()
+                    };
+                    m.y - (y + self.settings.dims()[1] + below_panel) - SCREEN_MARGIN >= CARD_SLOT
+                }
+                _ => true,
+            };
+            if !room_above && !room_below {
+                return;
+            }
+            self.card_above = room_above;
             self.card_visible = true;
             self.card_last = Some(rel);
             self.card_hide_at = None;
@@ -1900,7 +2467,7 @@ impl Haven {
         let (mut top, mut bottom) = (if self.panel_up { panel_total } else { 0.0 }, 0.0f32);
         if self.card_visible {
             if self.card_above {
-                top = top.max(CARD_SLOT);
+                top += CARD_SLOT; // above the player, or above an upward panel
             } else {
                 bottom = CARD_SLOT;
             }
@@ -1914,15 +2481,17 @@ impl Haven {
         }
         let want = [top, dims[0], top + base_h + bottom];
         self.want_top = want[0];
-        if want.iter().zip(self.req.iter()).all(|(a, b)| (a - b).abs() <= 0.5) {
+        if want
+            .iter()
+            .zip(self.req.iter())
+            .all(|(a, b)| (a - b).abs() <= 0.5)
+        {
             return;
         }
         // Menu / panel changes go through at once; only the cosmetic hover card
         // waits for the window to settle.
-        let urgent = self.menu_rel.is_some()
-            || self.menu_applied
-            || panel_total > 0.0
-            || self.panel_applied;
+        let urgent =
+            self.menu_rel.is_some() || self.menu_applied || panel_total > 0.0 || self.panel_applied;
         if !urgent && (self.layout_busy() || self.pos_changed.is_some()) {
             ctx.request_repaint_after(Duration::from_millis(120));
             return;
@@ -2011,7 +2580,7 @@ impl Haven {
 
 impl eframe::App for Haven {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        if self.pos_changed.is_some() || self.vol_dirty.is_some() {
+        if self.pos_changed.is_some() || self.vol_dirty.is_some() || self.eq_dirty.is_some() {
             self.settings.save();
         }
     }
@@ -2032,6 +2601,8 @@ impl eframe::App for Haven {
             Some(PLAYLIST_HEIGHT)
         } else if self.settings_open {
             Some(SETTINGS_HEIGHT)
+        } else if self.eq_open {
+            Some(EQ_HEIGHT)
         } else {
             None
         };
@@ -2111,6 +2682,13 @@ impl eframe::App for Haven {
                             .layout(egui::Layout::top_down(egui::Align::Min)),
                     );
                     self.draw_settings(&mut settings_ui);
+                } else if self.eq_open {
+                    let mut eq_ui = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(playlist_rect)
+                            .layout(egui::Layout::top_down(egui::Align::Min)),
+                    );
+                    self.draw_eq(&mut eq_ui);
                 }
                 if let Some(info) = &card_info {
                     Self::paint_card(ui, card_rect, info);
@@ -2130,8 +2708,8 @@ impl eframe::App for Haven {
                     .order(egui::Order::Foreground)
                     .fixed_pos(pos2(x, y))
                     .show(ctx, |ui| {
-                        let (rect, _) = ui
-                            .allocate_exact_size(vec2(MENU_WIDTH, MENU_BODY_H), Sense::hover());
+                        let (rect, _) =
+                            ui.allocate_exact_size(vec2(MENU_WIDTH, MENU_BODY_H), Sense::hover());
                         self.draw_menu(ui, rect, ctx);
                     });
                 self.menu_rect = Some(out.response.rect);
@@ -2149,7 +2727,11 @@ impl eframe::App for Haven {
 
         // Remember the volume (written 600 ms after the last change).
         let vnow = self.engine.shared.vol();
-        if self.settings.volume.map_or(true, |v| (v - vnow).abs() > 0.004) {
+        if self
+            .settings
+            .volume
+            .map_or(true, |v| (v - vnow).abs() > 0.004)
+        {
             self.settings.volume = Some(vnow);
             self.vol_dirty = Some(Instant::now());
         }
@@ -2159,6 +2741,14 @@ impl eframe::App for Haven {
                 self.vol_dirty = None;
             } else {
                 ctx.request_repaint_after(Duration::from_millis(650));
+            }
+        }
+        if let Some(t) = self.eq_dirty {
+            if t.elapsed() >= Duration::from_millis(500) {
+                self.settings.save();
+                self.eq_dirty = None;
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(550));
             }
         }
         if self.updater.busy() {
@@ -2174,6 +2764,26 @@ impl eframe::App for Haven {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
             } else {
                 ctx.request_repaint_after(Duration::from_millis(30));
+            }
+        }
+        // The engine thread applies play/pause a moment after the click. Without
+        // this the button kept showing the old state (until the mouse moved), so
+        // a second click toggled playback back off.
+        let had_input = ctx.input(|i| {
+            i.pointer.any_pressed()
+                || i.pointer.any_released()
+                || i.events
+                    .iter()
+                    .any(|e| matches!(e, egui::Event::Key { pressed: true, .. }))
+        });
+        if had_input {
+            self.poll_until = Some(Instant::now() + Duration::from_millis(700));
+        }
+        if let Some(t) = self.poll_until {
+            if Instant::now() < t {
+                ctx.request_repaint_after(Duration::from_millis(30));
+            } else {
+                self.poll_until = None;
             }
         }
         if self.engine.shared.playing.load(Relaxed) {

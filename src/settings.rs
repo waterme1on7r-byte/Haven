@@ -13,6 +13,9 @@ pub struct Settings {
     pub wave: u8,
     /// Last used volume 0..=1 (None = never changed).
     pub volume: Option<f32>,
+    /// Equalizer on/off and the ten band gains in dB (-12..=12).
+    pub eq_on: bool,
+    pub eq: [f32; 10],
 }
 
 impl Default for Settings {
@@ -24,6 +27,8 @@ impl Default for Settings {
             size: 2,
             wave: 0,
             volume: None,
+            eq_on: false,
+            eq: [0.0; 10],
         }
     }
 }
@@ -64,6 +69,7 @@ impl Settings {
                 match l {
                     "on_top=1" => s.on_top = true,
                     "locked=1" => s.locked = true,
+                    "eq_on=1" => s.eq_on = true,
                     _ => {
                         if let Some(v) = l.strip_prefix("x=") {
                             x = v.parse::<f32>().ok();
@@ -74,6 +80,13 @@ impl Settings {
                         if let Some(v) = l.strip_prefix("volume=") {
                             if let Ok(n) = v.parse::<f32>() {
                                 s.volume = Some(n.clamp(0.0, 1.0));
+                            }
+                        }
+                        if let Some(v) = l.strip_prefix("eq=") {
+                            for (i, n) in v.split(',').take(10).enumerate() {
+                                if let Ok(g) = n.trim().parse::<f32>() {
+                                    s.eq[i] = g.clamp(-12.0, 12.0);
+                                }
                             }
                         }
                         if let Some(v) = l.strip_prefix("wave=") {
@@ -107,6 +120,15 @@ impl Settings {
             let mut t = format!(
                 "on_top={}\nlocked={}\nsize={}\nwave={}\n",
                 self.on_top as u8, self.locked as u8, self.size, self.wave
+            );
+            t += &format!("eq_on={}\n", self.eq_on as u8);
+            t += &format!(
+                "eq={}\n",
+                self.eq
+                    .iter()
+                    .map(|g| format!("{g:.1}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
             );
             if let Some(v) = self.volume {
                 t += &format!("volume={v:.3}\n");

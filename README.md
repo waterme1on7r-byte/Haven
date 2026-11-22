@@ -4,7 +4,7 @@ Minimal lossless desktop player. Rust · egui (glow) · symphonia · cpal.
 
 ## Website
 
-The Haven landing page is published on [GitHub Pages](https://waterme1on7r-byte.github.io/Haven/). Its source lives in `site/`; `.github/workflows/pages.yml` deploys that folder.
+The Haven landing page is published on [GitHub Pages](https://waterme1on7r-byte.github.io/Haven/). Its source is the root `index.html`; `.github/workflows/pages.yml` deploys it with the required assets from `site/`.
 
 ## Build & run
 
@@ -32,12 +32,12 @@ The Haven landing page is published on [GitHub Pages](https://waterme1on7r-byte.
 Installers can be built locally with `cargo install cargo-packager --locked` followed by
 `cargo packager --release`. Windows produces an NSIS setup `.exe`; macOS produces a `.dmg`.
 The GitHub Actions workflow builds both formats on their native runners and uploads them as
-workflow artifacts. Pushing a version tag such as `v0.1.7` also publishes the installers as a
+workflow artifacts. Pushing a version tag such as `v0.1.8` also publishes the installers as a
 GitHub release. macOS packages are unsigned until a Developer ID certificate and notarization
 are configured.
 
 ## Controls
-Space play/pause · ←/→ seek 5 s · Shift+←/→ prev/next · ↑/↓ volume · M mute
+Space play/pause · ←/→ seek 5 s · Shift+←/→ prev/next · ↑/↓ volume · M mute · E equalizer on/off
 Drag on waveform to scrub · click waveform to jump · right-click waveform for the transport menu
 Progress ring (#ab4354) around the pill: click or drag it to seek, hover for elapsed / total time
 Right-click menu ("Mini Mixer"): prev / play-pause / next, a vertical volume fader (tap its speaker to mute), Shuffle / Repeat (cycles off → all → one) / Playlist chips, and an icon footer for Settings, Open files, Open folder, Minimize, Exit. Settings… opens a drawer under the player (same slot as the playlist) with Always on top, Lock position, Size (Small / Med / Big) and Wave style (5 live thumbnails); these are remembered between launches, along with the window position
@@ -45,6 +45,10 @@ Window: drag the top-edge grip, the frame around the pill (or the gap inside the
 The playlist opens as a panel attached below the player; it moves with the player and rows select tracks.
 Drop files/folders (or Open…) to add them to the playlist — what is playing keeps playing · Playlist → Clear empties the list but keeps the current track playing
 Hover anywhere over the player: a metadata card pops up above it (below if there is no room); once the mouse moves it fades after 3 s and returns after the pointer leaves and re-enters
+
+## Equalizer
+Settings → Equalizer opens a ten-band panel in the same slot (close returns to Settings). Bands sit one octave apart from 32 Hz to 16 kHz, ±12 dB in half-dB steps. Drag a fader, scroll over it to nudge, double-click to reset it. Presets: Flat, Bass, Vocal, Treble; Custom lights up when the faders match none. The switch in the panel header (or the E key) turns it on/off; on/off and gains are remembered between launches.
+The filters (peaking biquads, Q 1.41) run on the decoder thread before audio enters the ring, so the audio callback is untouched. When the EQ is off, or every band is 0 dB, audio is not touched at all and playback stays bit-exact. An automatic preamp cut equal to the largest boost prevents clipping. Changes are heard after about 0.3 s (the ring buffer).
 
 ## Architecture
 ```
@@ -76,14 +80,15 @@ Open the app itself (Haven.app), not the `haven` file inside `Contents/MacOS`. I
 ## Behaviour notes
 - Right-clicking the waveform only opens the menu; it never scrubs or seeks (a seek flushes the audio buffer and is audible). Left-click/drag still seeks.
 - Mouse wheel over the waveform changes volume (nowhere else); a short read-out shows the level.
-- The play button and Space are disabled while nothing is loaded.
+- The play button and Space are disabled while nothing is loaded. After the last track ends, one press of play restarts the queue (the window keeps repainting briefly after input so the button never shows a stale state).
+- The hover card goes above the player, or above the Playlist/Settings panel when that panel is docked upward.
 - The context menu closes immediately when the window loses focus, and Minimize waits until the window has shrunk back so it restores in the right place.
-- Skyline has no reflection (it looked like a doubled image).
+- Skyline bars stand on a baseline with a short, faded reflection underneath. Wave is a single smooth sine whose height follows loudness. No bar animates on its own: heights come only from the audio.
 - Playlist and Settings dock below the player, or above it when the screen has too little room below (decided when they open; the player never moves).
 
 ## Updates (GitHub Releases)
 1. `src/update.rs` checks releases from `waterme1on7r-byte/Haven`.
-2. Bump `version` in `Cargo.toml` (currently 0.1.7), commit, then push a matching tag, e.g. `v0.1.8` for the next release. CI refuses to build a tag that differs from the Cargo version and attaches the Windows installer (.exe) and macOS disk image (.dmg) to the release.
+2. Bump `version` in `Cargo.toml` (currently 0.1.8), commit, then push a matching tag, e.g. `v0.1.9` for the next release. CI refuses to build a tag that differs from the Cargo version and attaches the Windows installer (.exe) and macOS disk image (.dmg) to the release.
 3. Running copies check shortly after launch (at most once a day) and via Settings → Updates → Check. When a newer release exists, the Settings icon in the context menu gets a red dot; "Download" saves the installer to your Downloads folder and opens it. Haven never replaces itself, so quit the app to finish installing.
 
 The repository must be public (or the release assets reachable without a token) for the check to work.

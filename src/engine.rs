@@ -36,7 +36,15 @@ pub struct Shared {
     pub current_idx: AtomicU64,
     flush_req: AtomicU64,
     flush_ack: AtomicU64,
+    eq_on: AtomicBool,
+    eq_gain: [AtomicU32; 10],
+    eq_gen: AtomicU64,
 }
+
+/// Centre frequencies of the ten equalizer bands (Hz), one octave apart.
+pub const EQ_FREQS: [f32; 10] = [
+    32.0, 64.0, 125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0,
+];
 
 impl Shared {
     fn new() -> Self {
@@ -54,7 +62,18 @@ impl Shared {
             current_idx: AtomicU64::new(0),
             flush_req: AtomicU64::new(0),
             flush_ack: AtomicU64::new(0),
+            eq_on: AtomicBool::new(false),
+            eq_gain: std::array::from_fn(|_| AtomicU32::new(0.0f32.to_bits())),
+            eq_gen: AtomicU64::new(1),
         }
+    }
+    /// Sets the equalizer (gains in dB). The decoder thread picks it up on its next block.
+    pub fn set_eq(&self, on: bool, gains: [f32; 10]) {
+        for (a, g) in self.eq_gain.iter().zip(gains.iter()) {
+            a.store(g.clamp(-12.0, 12.0).to_bits(), Relaxed);
+        }
+        self.eq_on.store(on, Relaxed);
+        self.eq_gen.fetch_add(1, Release);
     }
     pub fn vol(&self) -> f32 {
         f32::from_bits(self.vol.load(Relaxed))
@@ -189,6 +208,119 @@ fn open_out(want: u32, sh: &Arc<Shared>) -> Result<Out> {
     })
 }
 
+/// One peaking biquad (RBJ cookbook), stereo, f64 state.
+#[derive(Clone, Copy, Default)]
+struct Bq {
+    b0: f64,
+    b1: f64,
+    b2: f64,
+    a1: f64,
+    a2: f64,
+    z1: [f64; 2],
+    z2: [f64; 2],
+    on: bool,
+}
+
+impl Bq {
+    fn set_peak(&mut self, fs: f64, f0: f64, gain_db: f64, q: f64) {
+        if gain_db.abs() < 0.05 || f0 >= fs * 0.45 {
+            self.on = false;
+            self.z1 = [0.0; 2];
+            self.z2 = [0.0; 2];
+            return;
+        }
+        let a = 10f64.powf(gain_db / 40.0);
+        let (s, c) = (std::f64::consts::TAU * f0 / fs).sin_cos();
+        let al = s / (2.0 * q);
+        let a0 = 1.0 + al / a;
+        self.b0 = (1.0 + al * a) / a0;
+        self.b1 = (-2.0 * c) / a0;
+        self.b2 = (1.0 - al * a) / a0;
+        self.a1 = (-2.0 * c) / a0;
+        self.a2 = (1.0 - al / a) / a0;
+        self.on = true;
+    }
+    #[inline]
+    fn run(&mut self, x: f64, ch: usize) -> f64 {
+        let y = self.b0 * x + self.z1[ch];
+        self.z1[ch] = self.b1 * x - self.a1 * y + self.z2[ch];
+        self.z2[ch] = self.b2 * x - self.a2 * y;
+        y
+    }
+}
+
+/// Ten-band equalizer applied to decoded blocks before they enter the ring.
+/// When it is off (or every band is 0 dB) blocks are not touched at all, so
+/// playback stays bit-exact.
+struct EqDsp {
+    bands: [Bq; 10],
+    pre: f64,
+    active: bool,
+    gen: u64,
+    rate: u32,
+}
+
+impl EqDsp {
+    fn new() -> Self {
+        Self {
+            bands: [Bq::default(); 10],
+            pre: 1.0,
+            active: false,
+            gen: u64::MAX,
+            rate: 0,
+        }
+    }
+    fn reset(&mut self) {
+        for b in self.bands.iter_mut() {
+            b.z1 = [0.0; 2];
+            b.z2 = [0.0; 2];
+        }
+    }
+    fn sync(&mut self, sh: &Shared, rate: u32) {
+        let gen = sh.eq_gen.load(Acquire);
+        if gen == self.gen && rate == self.rate {
+            return;
+        }
+        self.gen = gen;
+        self.rate = rate;
+        let on = sh.eq_on.load(Relaxed);
+        let (mut max_boost, mut any) = (0.0f64, false);
+        for i in 0..10 {
+            let g = f32::from_bits(sh.eq_gain[i].load(Relaxed)) as f64;
+            let g = if on { g } else { 0.0 };
+            self.bands[i].set_peak(rate as f64, EQ_FREQS[i] as f64, g, 1.41);
+            if g.abs() >= 0.05 {
+                any = true;
+                max_boost = max_boost.max(g);
+            }
+        }
+        let was = self.active;
+        self.active = on && any;
+        // Automatic preamp cut equal to the largest boost, so boosts cannot clip.
+        self.pre = 10f64.powf(-max_boost / 20.0);
+        if !was && self.active {
+            self.reset();
+        }
+    }
+    fn process(&mut self, buf: &mut [f32]) {
+        if !self.active {
+            return;
+        }
+        let pre = self.pre;
+        for f in buf.chunks_exact_mut(2) {
+            for ch in 0..2 {
+                let mut x = f[ch] as f64 * pre;
+                for b in self.bands.iter_mut() {
+                    if b.on {
+                        x = b.run(x, ch);
+                    }
+                }
+                f[ch] = (x as f32).clamp(-1.0, 1.0);
+            }
+        }
+    }
+}
+
 struct Core {
     sh: Arc<Shared>,
     queue: Vec<PathBuf>,
@@ -200,6 +332,7 @@ struct Core {
     base: u64,   // frames (out rate) at which the current segment started
     pushed: u64, // samples pushed since `base`
     rng: u64,
+    eq: EqDsp,
 }
 
 impl Core {
@@ -215,6 +348,7 @@ impl Core {
             base: 0,
             pushed: 0,
             rng: 0x9E37_79B9_7F4A_7C15,
+            eq: EqDsp::new(),
         }
     }
 
@@ -411,6 +545,9 @@ impl Core {
         *self.sh.info.lock().unwrap() = Some(info);
         self.sh.track_gen.fetch_add(1, Relaxed);
         self.reader = Some(r);
+        if !gapless {
+            self.eq.reset();
+        }
         self.pending.clear();
         self.poff = 0;
         self.base = 0;
@@ -434,6 +571,9 @@ impl Core {
                 Some(c) => {
                     self.pending = c;
                     self.poff = 0;
+                    let rate = self.out.as_ref().map_or(44100, |o| o.rate);
+                    self.eq.sync(&self.sh, rate);
+                    self.eq.process(&mut self.pending);
                 }
                 None => {
                     self.finish_track();
@@ -471,6 +611,7 @@ impl Core {
             return;
         };
         r.seek(s);
+        self.eq.reset();
         self.flush();
         self.pending.clear();
         self.poff = 0;
