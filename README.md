@@ -28,7 +28,7 @@ Minimal lossless desktop player. Rust · egui (glow) · symphonia · cpal.
 Installers can be built locally with `cargo install cargo-packager --locked` followed by
 `cargo packager --release`. Windows produces an NSIS setup `.exe`; macOS produces a `.dmg`.
 The GitHub Actions workflow builds both formats on their native runners and uploads them as
-workflow artifacts. Pushing a version tag such as `v0.1.5` also publishes the installers as a
+workflow artifacts. Pushing a version tag such as `v0.1.6` also publishes the installers as a
 GitHub release. macOS packages are unsigned until a Developer ID certificate and notarization
 are configured.
 
@@ -36,7 +36,7 @@ are configured.
 Space play/pause · ←/→ seek 5 s · Shift+←/→ prev/next · ↑/↓ volume · M mute
 Drag on waveform to scrub · click waveform to jump · right-click waveform for the transport menu
 Progress ring (#ab4354) around the pill: click or drag it to seek, hover for elapsed / total time
-Right-click menu also has Playlist, Size (S / M / B), Wave style (1–5), Minimize, Exit, Always on top and Lock position (these settings are remembered between launches, along with the window position)
+Right-click menu ("Mini Mixer"): prev / play-pause / next, a vertical volume fader (tap its speaker to mute), Shuffle / Repeat (cycles off → all → one) / Playlist chips, and an icon footer for Settings, Open files, Open folder, Minimize, Exit. Settings… opens a drawer under the player (same slot as the playlist) with Always on top, Lock position, Size (Small / Med / Big) and Wave style (5 live thumbnails); these are remembered between launches, along with the window position
 Window: drag the top-edge grip, the frame around the pill (or the gap inside the ring), or hold Alt/Option and drag anywhere. The right-click menu opens at the pointer, downward or — when the screen has too little room below — upward; the player itself never moves.
 The playlist opens as a panel attached below the player; it moves with the player and rows select tracks.
 Drop files/folders (or Open…) to add them to the playlist — what is playing keeps playing · Playlist → Clear empties the list but keeps the current track playing
@@ -68,3 +68,9 @@ CI ad-hoc signs and verifies the app (no Apple Developer account, so no notariza
     xattr -cr /Applications/Haven.app
 
 Open the app itself (Haven.app), not the `haven` file inside `Contents/MacOS`. If it still refuses, sign it locally: `codesign --force --deep --sign - /Applications/Haven.app`.
+
+## Behaviour notes
+- Right-clicking the waveform only opens the menu; it never scrubs or seeks (a seek flushes the audio buffer and is audible). Left-click/drag still seeks.
+- Mouse wheel over the waveform changes volume (nowhere else); a short read-out shows the level.
+- The play button and Space are disabled while nothing is loaded.
+- The context menu closes immediately when the window loses focus, and Minimize waits until the window has shrunk back so it restores in the right place.

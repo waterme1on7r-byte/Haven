@@ -30,9 +30,11 @@ const ACCENT: Color32 = Color32::from_rgb(0xab, 0x43, 0x54); // progress ring
 const RING_TRACK: Color32 = Color32::from_rgb(0x2f, 0x30, 0x32);
 // Slightly wider time bins keep the moving waveform calm at every window size.
 const SECS_PER_BAR: f64 = 0.125;
-const MENU_HEIGHT: f32 = 400.0; // room reserved for the context menu
-const MENU_WIDTH: f32 = 190.0;
+const MENU_BODY_H: f32 = 244.0; // drawn height of the Mini Mixer menu
+const MENU_HEIGHT: f32 = 250.0; // window room reserved for it
+const MENU_WIDTH: f32 = 200.0;
 const PLAYLIST_HEIGHT: f32 = 270.0;
+const SETTINGS_HEIGHT: f32 = 270.0;
 const PLAYLIST_GAP: f32 = 5.0;
 const HOVER_CARD_HEIGHT: f32 = 55.0;
 const CARD_SLOT: f32 = HOVER_CARD_HEIGHT + 4.0; // window room the card needs
@@ -48,13 +50,20 @@ pub struct Haven {
     settings: Settings,
     pos_changed: Option<Instant>,
     playlist_open: bool,
+    settings_open: bool,
     // Context menu: anchored to the click, opens downward or upward.
     menu_rel: Option<egui::Vec2>, // click position relative to the player's top-left
     menu_up: bool,
     menu_right: bool,
     menu_rect: Option<Rect>,
     menu_close: bool,
-    menu_unfocused_since: Option<Instant>,
+    menu_opened_at: Option<Instant>,
+    menu_applied: bool,         // the last layout sent included room for the menu
+    anchor: Option<egui::Pos2>, // player top-left in screen coordinates
+    target_outer: Option<egui::Pos2>, // where the last layout command put the window
+    minimize_pending: Option<Instant>,
+    vol_flash: Option<Instant>,
+    drag_moved: bool,
     // Hover metadata card shown outside the player.
     card_visible: bool,
     card_above: bool,
@@ -214,12 +223,19 @@ impl Haven {
             settings,
             pos_changed: None,
             playlist_open: false,
+            settings_open: false,
             menu_rel: None,
             menu_up: false,
             menu_right: false,
             menu_rect: None,
             menu_close: false,
-            menu_unfocused_since: None,
+            menu_opened_at: None,
+            menu_applied: false,
+            anchor: None,
+            target_outer: None,
+            minimize_pending: None,
+            vol_flash: None,
+            drag_moved: false,
             card_visible: false,
             card_above: true,
             card_suppressed: false,
@@ -247,10 +263,12 @@ impl Haven {
     fn track_position(&mut self, ctx: &egui::Context) {
         // Skip while the window is being resized for the card / menu: the outer
         // rect is not trustworthy then. Store the player's top, not the window's.
+        let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
         if let Some(r) = ctx
             .input(|i| i.viewport().outer_rect)
-            .filter(|_| !self.layout_busy())
+            .filter(|_| !self.layout_busy() && !minimized)
         {
+            self.anchor = Some(pos2(r.min.x, r.min.y + self.top_pad));
             let p = (r.min.x.round(), (r.min.y + self.top_pad).round());
             if self.settings.pos != Some(p) {
                 self.settings.pos = Some(p);
@@ -292,7 +310,7 @@ impl Haven {
         self.menu_rel = None;
         self.menu_rect = None;
         self.menu_close = false;
-        self.menu_unfocused_since = None;
+        self.menu_opened_at = None;
     }
 
     /// Opens the menu at `pt`. It opens downward unless the screen has too little
@@ -313,122 +331,343 @@ impl Haven {
         };
         self.menu_right = (pt.x - origin.x) + MENU_WIDTH > width;
         self.menu_rel = Some(pt - origin);
+        self.menu_opened_at = Some(Instant::now());
         self.menu_rect = None;
         self.menu_close = false;
     }
 
-    fn show_context_menu(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let sh = self.engine.shared.clone();
-        if ui.button("Previous").clicked() {
-            self.engine.prev();
-            self.menu_close = true;
-        }
-        if ui.button("Next").clicked() {
-            self.engine.next();
-            self.menu_close = true;
-        }
-        ui.separator();
-        if ui
-            .button(if self.playlist_open {
-                "Hide playlist"
-            } else {
-                "Playlist"
-            })
-            .clicked()
-        {
-            self.playlist_open = !self.playlist_open;
-            self.menu_close = true;
-        }
-        let mut v = sh.vol();
-        if ui
-            .add(
-                egui::Slider::new(&mut v, 0.0..=1.0)
-                    .text("Volume")
-                    .show_value(false),
+    /// Round / rounded-square button face used by the Mini Mixer menu.
+    fn menu_btn(
+        ui: &mut egui::Ui,
+        rect: Rect,
+        id: &str,
+        active: bool,
+        circle: bool,
+    ) -> egui::Response {
+        let resp = ui
+            .interact(rect, ui.id().with(id), Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        let rr = Rounding::same(if circle { rect.width() / 2.0 } else { 11.0 });
+        let (fill, edge) = if active {
+            (RED, RED)
+        } else if resp.hovered() {
+            (
+                Color32::from_rgb(0x2b, 0x2c, 0x2f),
+                Color32::from_rgb(0x4a, 0x4b, 0x4f),
             )
-            .changed()
-        {
-            sh.set_vol(v);
-        }
-        let mut m = sh.muted.load(Relaxed);
-        if ui.checkbox(&mut m, "Mute").changed() {
-            sh.muted.store(m, Relaxed);
-        }
-        let mut s = sh.shuffle.load(Relaxed);
-        if ui.checkbox(&mut s, "Shuffle").changed() {
-            sh.shuffle.store(s, Relaxed);
-        }
-        let mut rep = sh.repeat.load(Relaxed);
-        let before = rep;
-        ui.radio_value(&mut rep, 0u8, "Repeat off");
-        ui.radio_value(&mut rep, 1u8, "Repeat all");
-        ui.radio_value(&mut rep, 2u8, "Repeat one");
-        if rep != before {
-            sh.repeat.store(rep, Relaxed);
-        }
-        ui.separator();
-        // The window resizes itself from `settings.size` (see sync_layout).
-        ui.horizontal(|ui| {
-            ui.label("Size");
-            for (n, label) in [(0u8, "S"), (1, "M"), (2, "B")] {
-                if ui
-                    .selectable_label(self.settings.size == n, label)
-                    .clicked()
-                {
-                    self.settings.size = n;
-                    self.settings.save();
+        } else {
+            (BTN_FACE, PILL_EDGE)
+        };
+        ui.painter().rect_filled(rect, rr, fill);
+        ui.painter().rect_stroke(rect, rr, Stroke::new(1.0, edge));
+        resp
+    }
+
+    /// Line-art glyphs (about 16 px box) so the menu needs no icon font.
+    fn glyph(p: &egui::Painter, c: egui::Pos2, kind: &str, col: Color32) {
+        let st = Stroke::new(1.6, col);
+        let pt = |x: f32, y: f32| c + vec2(x, y);
+        let tri = |a: (f32, f32), b: (f32, f32), d: (f32, f32)| {
+            p.add(Shape::convex_polygon(
+                vec![pt(a.0, a.1), pt(b.0, b.1), pt(d.0, d.1)],
+                col,
+                Stroke::NONE,
+            ));
+        };
+        let line = |pts: &[(f32, f32)]| {
+            p.add(Shape::line(pts.iter().map(|q| pt(q.0, q.1)).collect(), st));
+        };
+        let closed = |pts: &[(f32, f32)]| {
+            p.add(Shape::closed_line(
+                pts.iter().map(|q| pt(q.0, q.1)).collect(),
+                st,
+            ));
+        };
+        match kind {
+            "prev" => {
+                line(&[(-6.0, -6.0), (-6.0, 6.0)]);
+                tri((7.0, -6.0), (7.0, 6.0), (-3.0, 0.0));
+            }
+            "next" => {
+                line(&[(6.0, -6.0), (6.0, 6.0)]);
+                tri((-7.0, -6.0), (-7.0, 6.0), (3.0, 0.0));
+            }
+            "play" => tri((-4.0, -7.0), (-4.0, 7.0), (7.0, 0.0)),
+            "pause" => {
+                line(&[(-3.5, -6.0), (-3.5, 6.0)]);
+                line(&[(3.5, -6.0), (3.5, 6.0)]);
+            }
+            "shuf" => {
+                line(&[(-7.0, -4.0), (-3.0, -4.0), (3.0, 4.0), (5.0, 4.0)]);
+                line(&[(-7.0, 4.0), (-3.0, 4.0), (-1.0, 1.5)]);
+                line(&[(1.0, -1.5), (3.0, -4.0), (5.0, -4.0)]);
+                tri((4.0, -7.0), (4.0, -1.0), (8.0, -4.0));
+                tri((4.0, 1.0), (4.0, 7.0), (8.0, 4.0));
+            }
+            "rep" => {
+                line(&[(-6.0, 3.0), (-6.0, -4.0), (3.0, -4.0)]);
+                tri((2.0, -7.0), (2.0, -1.0), (7.0, -4.0));
+                line(&[(6.0, -3.0), (6.0, 4.0), (-3.0, 4.0)]);
+                tri((-2.0, 1.0), (-2.0, 7.0), (-7.0, 4.0));
+            }
+            "vol" | "mute" => {
+                p.add(Shape::convex_polygon(
+                    vec![
+                        pt(-7.0, -2.5),
+                        pt(-3.5, -2.5),
+                        pt(1.0, -6.0),
+                        pt(1.0, 6.0),
+                        pt(-3.5, 2.5),
+                        pt(-7.0, 2.5),
+                    ],
+                    col,
+                    Stroke::NONE,
+                ));
+                if kind == "vol" {
+                    line(&[(4.0, -3.5), (6.0, 0.0), (4.0, 3.5)]);
+                } else {
+                    line(&[(4.0, -3.0), (9.0, 3.0)]);
+                    line(&[(9.0, -3.0), (4.0, 3.0)]);
                 }
             }
-        });
-        ui.horizontal(|ui| {
-            ui.label("Wave");
-            for n in 0..5u8 {
-                if ui
-                    .selectable_label(self.settings.wave == n, format!("{}", n + 1))
-                    .clicked()
-                {
-                    self.settings.wave = n;
-                    self.settings.save();
-                }
+            "list" => {
+                line(&[(-6.0, -5.0), (6.0, -5.0)]);
+                line(&[(-6.0, 0.0), (6.0, 0.0)]);
+                line(&[(-6.0, 5.0), (1.0, 5.0)]);
             }
-        });
-        let mut top = self.settings.on_top;
-        if ui.checkbox(&mut top, "Always on top").changed() {
-            self.settings.on_top = top;
-            self.settings.save();
-            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(if top {
-                egui::WindowLevel::AlwaysOnTop
+            "cog" => {
+                line(&[(-7.0, -3.5), (7.0, -3.5)]);
+                line(&[(-7.0, 3.5), (7.0, 3.5)]);
+                p.circle_filled(pt(-2.5, -3.5), 2.4, col);
+                p.circle_filled(pt(3.0, 3.5), 2.4, col);
+            }
+            "file" => {
+                closed(&[
+                    (-5.0, -7.0),
+                    (1.5, -7.0),
+                    (5.5, -3.0),
+                    (5.5, 7.0),
+                    (-5.0, 7.0),
+                ]);
+                line(&[(1.5, -7.0), (1.5, -3.0), (5.5, -3.0)]);
+            }
+            "fold" => closed(&[
+                (-7.0, -4.5),
+                (-2.0, -4.5),
+                (0.0, -2.5),
+                (7.0, -2.5),
+                (7.0, 5.0),
+                (-7.0, 5.0),
+            ]),
+            "min" => line(&[(-6.0, 5.0), (6.0, 5.0)]),
+            _ => {
+                // power
+                line(&[(0.0, -7.0), (0.0, 0.0)]);
+                let arc: Vec<(f32, f32)> = (0..=20)
+                    .map(|i| {
+                        let th = (40.0 + i as f32 * 14.0).to_radians();
+                        (6.5 * th.sin(), 1.5 - 6.5 * th.cos())
+                    })
+                    .collect();
+                line(&arc);
+            }
+        }
+    }
+
+    /// Mini Mixer context menu: transport, vertical volume fader, toggle chips
+    /// and an icon-only footer, all drawn in the player's own palette.
+    fn draw_menu(&mut self, ui: &mut egui::Ui, rect: Rect, ctx: &egui::Context) {
+        let sh = self.engine.shared.clone();
+        let p = ui.painter().clone();
+        let r = Rounding::same(18.0);
+        p.rect_filled(
+            rect.translate(vec2(0.0, 3.0)),
+            r,
+            Color32::from_black_alpha(70),
+        );
+        p.rect_filled(rect, r, PILL);
+        p.rect_stroke(rect, r, Stroke::new(1.0, PILL_EDGE));
+        let pad = 12.0;
+        let (left, right) = (rect.left() + pad, rect.right() - pad);
+
+        // ---- transport (stays open so you can skip around) ----
+        let ty = rect.top() + pad + 21.0;
+        let playing = sh.playing.load(Relaxed);
+        let has_media = !sh.queue_info.lock().unwrap().is_empty();
+        let prev = Rect::from_center_size(pos2(left + 17.0, ty), vec2(34.0, 34.0));
+        let next = Rect::from_center_size(pos2(right - 17.0, ty), vec2(34.0, 34.0));
+        let play = Rect::from_center_size(pos2(rect.center().x, ty), vec2(42.0, 42.0));
+        if Self::menu_btn(ui, prev, "prev", false, false).clicked() {
+            self.engine.prev();
+        }
+        Self::glyph(&p, prev.center(), "prev", ICON);
+        if Self::menu_btn(ui, play, "play", has_media, true).clicked() && has_media {
+            self.engine.toggle();
+        }
+        Self::glyph(
+            &p,
+            play.center(),
+            if playing { "pause" } else { "play" },
+            if has_media {
+                Color32::WHITE
             } else {
-                egui::WindowLevel::Normal
-            }));
+                Color32::from_gray(0x5c)
+            },
+        );
+        if Self::menu_btn(ui, next, "next", false, false).clicked() {
+            self.engine.next();
         }
-        let mut lock = self.settings.locked;
-        if ui.checkbox(&mut lock, "Lock position").changed() {
-            self.settings.locked = lock;
-            self.settings.save();
+        Self::glyph(&p, next.center(), "next", ICON);
+
+        // ---- vertical volume fader (bottom of it toggles mute) ----
+        let fader = Rect::from_min_size(pos2(left, rect.top() + pad + 52.0), vec2(34.0, 118.0));
+        let muted = sh.muted.load(Relaxed);
+        let vol = sh.vol().clamp(0.0, 1.0);
+        let fr = Rounding::same(12.0);
+        p.rect_filled(fader, fr, WELL);
+        let fill_h = (fader.height() * vol).max(if vol > 0.0 { 12.0 } else { 0.0 });
+        if fill_h > 0.0 {
+            p.rect_filled(
+                Rect::from_min_max(
+                    pos2(fader.left(), fader.bottom() - fill_h),
+                    fader.right_bottom(),
+                ),
+                fr,
+                if muted {
+                    Color32::from_rgb(0x5a, 0x5b, 0x5e)
+                } else {
+                    RED
+                },
+            );
         }
-        ui.separator();
-        if ui.button("Open files…").clicked() {
-            if let Some(f) = rfd::FileDialog::new()
-                .add_filter("Audio", EXTS)
-                .pick_files()
-            {
-                self.open(f, true);
+        let mute_zone = Rect::from_min_max(
+            pos2(fader.left(), fader.bottom() - 30.0),
+            fader.right_bottom(),
+        );
+        Self::glyph(
+            &p,
+            mute_zone.center(),
+            if muted { "mute" } else { "vol" },
+            Color32::WHITE,
+        );
+        let fresp = ui
+            .interact(fader, ui.id().with("fader"), Sense::click_and_drag())
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        if let Some(pos) = fresp.interact_pointer_pos() {
+            if fresp.clicked() && mute_zone.contains(pos) {
+                sh.muted.store(!muted, Relaxed);
+            } else if fresp.clicked() || fresp.dragged() {
+                sh.set_vol(((fader.bottom() - pos.y) / fader.height()).clamp(0.0, 1.0));
+                sh.muted.store(false, Relaxed);
             }
-            self.menu_close = true;
         }
-        if ui.button("Open folder…").clicked() {
-            if let Some(f) = rfd::FileDialog::new().pick_folder() {
-                self.open(vec![f], true);
+
+        // ---- toggle chips ----
+        let chip_x = fader.right() + 12.0;
+        let chip_h = 35.0;
+        let chip_gap = (fader.height() - chip_h * 3.0) / 2.0;
+        let rep = sh.repeat.load(Relaxed);
+        let shuffle = sh.shuffle.load(Relaxed);
+        let chips: [(&str, &str, bool, String); 3] = [
+            ("c-shuf", "shuf", shuffle, "Shuffle".to_string()),
+            (
+                "c-rep",
+                "rep",
+                rep != 0,
+                ["Repeat off", "Repeat all", "Repeat one"][(rep as usize).min(2)].to_string(),
+            ),
+            ("c-list", "list", self.playlist_open, "Playlist".to_string()),
+        ];
+        for (i, (id, g, active, text)) in chips.iter().enumerate() {
+            let cr = Rect::from_min_size(
+                pos2(chip_x, fader.top() + i as f32 * (chip_h + chip_gap)),
+                vec2(right - chip_x, chip_h),
+            );
+            let resp = Self::menu_btn(ui, cr, id, *active, false);
+            let ink = if *active { Color32::WHITE } else { ICON };
+            Self::glyph(&p, pos2(cr.left() + 17.0, cr.center().y), g, ink);
+            p.text(
+                pos2(cr.left() + 32.0, cr.center().y),
+                Align2::LEFT_CENTER,
+                text,
+                FontId::proportional(11.5),
+                ink,
+            );
+            if resp.clicked() {
+                match i {
+                    0 => sh.shuffle.store(!shuffle, Relaxed),
+                    1 => sh.repeat.store((rep + 1) % 3, Relaxed),
+                    _ => {
+                        self.playlist_open = !self.playlist_open;
+                        if self.playlist_open {
+                            self.settings_open = false;
+                        }
+                        self.menu_close = true;
+                    }
+                }
             }
-            self.menu_close = true;
         }
-        if ui.button("Minimize").clicked() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-            self.menu_close = true;
-        }
-        if ui.button("Exit").clicked() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+
+        // ---- footer: icon-only, tooltips name them ----
+        let sep_y = fader.bottom() + 10.0;
+        p.line_segment(
+            [pos2(left, sep_y), pos2(right, sep_y)],
+            Stroke::new(1.0, PILL_EDGE),
+        );
+        let foot_y = sep_y + 9.0 + 16.0;
+        let foot: [(&str, &str, &str); 5] = [
+            ("f-cog", "cog", "Settings"),
+            ("f-file", "file", "Open files…"),
+            ("f-fold", "fold", "Open folder…"),
+            ("f-min", "min", "Minimize"),
+            ("f-pow", "pow", "Exit"),
+        ];
+        for (i, (id, g, tip)) in foot.iter().enumerate() {
+            let c = pos2(left + 16.0 + i as f32 * 36.0, foot_y);
+            let br = Rect::from_center_size(c, vec2(32.0, 32.0));
+            let resp =
+                Self::menu_btn(ui, br, id, i == 0 && self.settings_open, false).on_hover_text(*tip);
+            let ink = if i == 4 {
+                RED
+            } else if i == 0 && self.settings_open {
+                Color32::WHITE
+            } else {
+                ICON
+            };
+            Self::glyph(&p, c, g, ink);
+            if resp.clicked() {
+                match i {
+                    0 => {
+                        self.settings_open = !self.settings_open;
+                        if self.settings_open {
+                            self.playlist_open = false;
+                        }
+                        self.menu_close = true;
+                    }
+                    1 => {
+                        if let Some(f) = rfd::FileDialog::new()
+                            .add_filter("Audio", EXTS)
+                            .pick_files()
+                        {
+                            self.open(f, true);
+                        }
+                        self.menu_close = true;
+                    }
+                    2 => {
+                        if let Some(f) = rfd::FileDialog::new().pick_folder() {
+                            self.open(vec![f], true);
+                        }
+                        self.menu_close = true;
+                    }
+                    3 => {
+                        // Minimize only after the window has shrunk back, otherwise
+                        // it is restored at the wrong place.
+                        self.minimize_pending = Some(Instant::now());
+                        self.menu_close = true;
+                    }
+                    _ => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                }
+            }
         }
     }
 
@@ -436,8 +675,9 @@ impl Haven {
         let sh = self.engine.shared.clone();
         let pos = sh.pos_ms.load(Relaxed) as f64 / 1000.0;
         let dur = sh.dur_ms.load(Relaxed) as f64 / 1000.0;
+        let has_media = !sh.queue_info.lock().unwrap().is_empty();
         ctx.input_mut(|i| {
-            if i.consume_key(Modifiers::NONE, Key::Space) {
+            if i.consume_key(Modifiers::NONE, Key::Space) && has_media {
                 self.engine.toggle();
             }
             if i.consume_key(Modifiers::SHIFT, Key::ArrowRight) {
@@ -500,6 +740,7 @@ impl Haven {
         let off = h * 0.09;
         let ring_rect = pill.expand(off);
         let ring = ring_pts(ring_rect, h * 0.17 + off);
+        let has_media = !sh.queue_info.lock().unwrap().is_empty();
         // A native window move must begin on the same mouse-down event. Starting
         // it after egui's drag threshold is crossed is intermittent on Windows.
         let begin_window_drag = ctx.input(|i| {
@@ -513,7 +754,7 @@ impl Haven {
             let on_progress_ring = nearest_frac(&ring, pt).0 <= sw * 2.0;
             if full.contains(pt)
                 && !well.contains(pt)
-                && !brect.contains(pt)
+                && !(has_media && brect.contains(pt))
                 && !on_progress_ring
                 && !self.menu_rect.map_or(false, |r| r.contains(pt))
                 && !self.settings.locked
@@ -529,35 +770,59 @@ impl Haven {
         );
 
         // ---- interaction ----
-        let btn = ui
-            .interact(brect, id.with("btn"), Sense::click_and_drag())
-            .on_hover_cursor(egui::CursorIcon::PointingHand);
-        if btn.clicked() {
+        let btn = ui.interact(brect, id.with("btn"), Sense::click_and_drag());
+        let btn = if has_media {
+            btn.on_hover_cursor(egui::CursorIcon::PointingHand)
+        } else {
+            btn
+        };
+        if btn.clicked() && has_media {
             self.engine.toggle();
         }
 
         let wresp = ui.interact(well, id.with("wave"), Sense::click_and_drag());
         let dur = sh.dur_ms.load(Relaxed) as f64 / 1000.0;
         let real_pos = sh.pos_ms.load(Relaxed) as f64 / 1000.0;
-        if wresp.drag_started() {
+        // Primary button only: a right-click on the wave (it opens the menu) must
+        // never scrub or seek, because every seek flushes the audio buffer.
+        if wresp.drag_started_by(egui::PointerButton::Primary) {
+            self.drag_moved = false;
             if ctx.input(|i| i.modifiers.alt) && !self.settings.locked {
                 ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag); // Alt/Option+drag moves the window
             } else {
                 self.drag = Some(real_pos);
             }
         }
-        if wresp.dragged() {
+        if wresp.dragged_by(egui::PointerButton::Primary) {
+            if wresp.drag_delta().x != 0.0 {
+                self.drag_moved = true;
+            }
             if let Some(dp) = self.drag.as_mut() {
                 *dp = (*dp - (wresp.drag_delta().x / pitch) as f64 * SECS_PER_BAR).clamp(0.0, dur);
             }
         }
-        if wresp.drag_stopped() {
+        if wresp.drag_stopped_by(egui::PointerButton::Primary) {
             if let Some(dp) = self.drag.take() {
-                self.engine.seek(dp);
+                if self.drag_moved {
+                    self.engine.seek(dp);
+                }
+            }
+            self.drag_moved = false;
+        }
+        // Mouse wheel over the waveform = volume (only here).
+        if wresp.hovered() {
+            let dy = ctx.input(|i| i.smooth_scroll_delta.y);
+            if dy.abs() > 0.01 {
+                sh.set_vol(sh.vol() + dy * 0.0015);
+                sh.muted.store(false, Relaxed);
+                self.vol_flash = Some(Instant::now());
             }
         }
         if wresp.clicked() {
-            if let Some(pt) = wresp.interact_pointer_pos() {
+            if let Some(pt) = wresp
+                .interact_pointer_pos()
+                .filter(|pt| (pt.x - cx).abs() > 4.0)
+            {
                 self.engine
                     .seek((real_pos + ((pt.x - cx) / pitch) as f64 * SECS_PER_BAR).clamp(0.0, dur));
             }
@@ -623,7 +888,16 @@ impl Haven {
         }
 
         // ---- button ----
-        let hot = if btn.hovered() { 1.15 } else { 1.0 };
+        let hot = if has_media && btn.hovered() {
+            1.15
+        } else {
+            1.0
+        };
+        let icon_col = if has_media {
+            ICON
+        } else {
+            ICON.gamma_multiply(0.3)
+        };
         p.circle(
             bc,
             r,
@@ -640,7 +914,7 @@ impl Haven {
             let (bw, bh, gap) = (d * 0.105, d * 0.315, d * 0.11);
             for s in [-1.0f32, 1.0] {
                 let c = pos2(bc.x + s * (gap / 2.0 + bw / 2.0), bc.y);
-                p.rect_filled(Rect::from_center_size(c, vec2(bw, bh)), bw * 0.3, ICON);
+                p.rect_filled(Rect::from_center_size(c, vec2(bw, bh)), bw * 0.3, icon_col);
             }
         } else {
             let s = d * 0.17;
@@ -650,7 +924,7 @@ impl Haven {
                     pos2(bc.x - s * 0.7, bc.y + s * 1.1),
                     pos2(bc.x + s * 1.2, bc.y),
                 ],
-                ICON,
+                icon_col,
                 Stroke::NONE,
             ));
         }
@@ -913,6 +1187,32 @@ impl Haven {
             RED,
             Stroke::NONE,
         ));
+
+        // brief volume read-out after a wheel scroll
+        if let Some(t) = self.vol_flash {
+            if t.elapsed() < Duration::from_millis(900) {
+                let txt = if sh.muted.load(Relaxed) {
+                    "Muted".to_string()
+                } else {
+                    format!("Volume {}%", (sh.vol() * 100.0).round() as i32)
+                };
+                let rc = Rect::from_center_size(
+                    pos2(well.center().x, well.top() + well.height() * 0.2),
+                    vec2(96.0, 22.0),
+                );
+                p.rect_filled(rc, Rounding::same(11.0), Color32::from_black_alpha(190));
+                p.text(
+                    rc.center(),
+                    Align2::CENTER_CENTER,
+                    txt,
+                    FontId::proportional(11.0),
+                    Color32::from_gray(0xe6),
+                );
+                ctx.request_repaint_after(Duration::from_millis(100));
+            } else {
+                self.vol_flash = None;
+            }
+        }
     }
 
     fn draw_playlist(&mut self, ui: &mut egui::Ui) {
@@ -1176,6 +1476,279 @@ impl Haven {
 }
 
 impl Haven {
+    /// Whole-row switch: label on the left, pill switch on the right.
+    fn switch_row(ui: &mut egui::Ui, row: Rect, id: &str, label: &str, on: bool) -> bool {
+        let resp = ui
+            .interact(row, ui.id().with(id), Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        let p = ui.painter();
+        p.text(
+            row.left_center(),
+            Align2::LEFT_CENTER,
+            label,
+            FontId::proportional(13.0),
+            if resp.hovered() {
+                Color32::WHITE
+            } else {
+                Color32::from_gray(0xe0)
+            },
+        );
+        let track = Rect::from_center_size(row.right_center() - vec2(17.0, 0.0), vec2(34.0, 18.0));
+        p.rect_filled(
+            track,
+            Rounding::same(9.0),
+            if on {
+                RED
+            } else {
+                Color32::from_rgb(0x3a, 0x3b, 0x3e)
+            },
+        );
+        let kx = if on {
+            track.right() - 9.0
+        } else {
+            track.left() + 9.0
+        };
+        p.circle_filled(
+            pos2(kx, track.center().y),
+            7.0,
+            if on {
+                Color32::WHITE
+            } else {
+                Color32::from_gray(0x9a)
+            },
+        );
+        resp.clicked()
+    }
+
+    /// Tiny drawing of each waveform style for the picker tiles.
+    fn wave_thumb(p: &egui::Painter, r: Rect, style: u8) {
+        const H: [f32; 7] = [0.4, 0.8, 0.55, 1.0, 0.5, 0.75, 0.35];
+        let ink = Color32::from_gray(0xd8);
+        let aw = r.width() * 0.62;
+        let left = r.center().x - aw / 2.0;
+        let maxh = r.height() * 0.58;
+        let cy = r.center().y;
+        match style {
+            0 => {
+                for (i, v) in H.iter().enumerate() {
+                    let x = left + (i as f32 + 0.5) * aw / 7.0;
+                    p.rect_filled(
+                        Rect::from_center_size(pos2(x, cy), vec2(3.0, v * maxh)),
+                        1.5,
+                        ink,
+                    );
+                }
+            }
+            1 => {
+                for i in 0..12 {
+                    let v = 0.25 + 0.75 * (i as f32 * 1.7).sin().abs();
+                    let x = left + (i as f32 + 0.5) * aw / 12.0;
+                    p.rect_filled(
+                        Rect::from_center_size(pos2(x, cy), vec2(1.2, v * maxh)),
+                        0.6,
+                        ink,
+                    );
+                }
+            }
+            2 => {
+                let base = cy + maxh / 2.0;
+                for (i, v) in H.iter().enumerate() {
+                    let x = left + (i as f32 + 0.5) * aw / 7.0;
+                    p.rect_filled(
+                        Rect::from_min_max(pos2(x - 1.5, base - v * maxh), pos2(x + 1.5, base)),
+                        1.5,
+                        ink,
+                    );
+                }
+            }
+            3 => {
+                for (i, v) in H.iter().enumerate() {
+                    let x = left + (i as f32 + 0.5) * aw / 7.0;
+                    for k in 0..((v * 4.0).round() as i32) {
+                        for sg in [-1.0f32, 1.0] {
+                            p.rect_filled(
+                                Rect::from_center_size(
+                                    pos2(x, cy + sg * k as f32 * 3.4),
+                                    vec2(3.0, 2.0),
+                                ),
+                                0.8,
+                                ink,
+                            );
+                        }
+                    }
+                }
+            }
+            _ => {
+                let pts: Vec<egui::Pos2> = (0..=24)
+                    .map(|i| {
+                        let t = i as f32 / 24.0;
+                        pos2(
+                            left + t * aw,
+                            cy - (t * std::f32::consts::TAU * 2.5).sin() * maxh * 0.45,
+                        )
+                    })
+                    .collect();
+                p.add(Shape::line(pts, Stroke::new(1.4, ink)));
+            }
+        }
+    }
+
+    /// Settings drawer: docks under the player exactly like the playlist.
+    fn draw_settings(&mut self, ui: &mut egui::Ui) {
+        let rect = ui.max_rect();
+        let painter = ui.painter().clone();
+        let outer = Rounding::same(22.0);
+        painter.rect_filled(rect.shrink(8.0), outer, PILL);
+        painter.rect_stroke(rect.shrink(8.0), outer, Stroke::new(1.0, PILL_EDGE));
+        let (left, right) = (rect.left() + 27.0, rect.right() - 27.0);
+
+        let header = Rect::from_min_max(
+            pos2(left, rect.top() + 13.0),
+            pos2(right, rect.top() + 43.0),
+        );
+        painter.text(
+            header.left_center(),
+            Align2::LEFT_CENTER,
+            "Settings",
+            FontId::proportional(16.0),
+            Color32::from_gray(0xe6),
+        );
+        let close = Rect::from_center_size(
+            pos2(header.right() - 8.0, header.center().y),
+            vec2(31.0, 31.0),
+        );
+        let close_resp = ui
+            .interact(close, ui.id().with("settings-close"), Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        let (fill, ink) = if close_resp.hovered() {
+            (Color32::from_rgb(0x43, 0x23, 0x2a), RED)
+        } else {
+            (
+                Color32::from_rgb(0x18, 0x19, 0x1a),
+                Color32::from_gray(0xc8),
+            )
+        };
+        painter.rect_filled(close, Rounding::same(10.0), fill);
+        painter.rect_stroke(close, Rounding::same(10.0), Stroke::new(1.0, PILL_EDGE));
+        for (a, b) in [((-4.0, -4.0), (4.0, 4.0)), ((4.0, -4.0), (-4.0, 4.0))] {
+            painter.line_segment(
+                [
+                    close.center() + vec2(a.0, a.1),
+                    close.center() + vec2(b.0, b.1),
+                ],
+                Stroke::new(1.8, ink),
+            );
+        }
+        if close_resp.clicked() {
+            self.settings_open = false; // window shrinks itself (sync_layout)
+        }
+
+        let label = |y: f32, text: &str| {
+            painter.text(
+                pos2(left, y),
+                Align2::LEFT_TOP,
+                text,
+                FontId::proportional(10.0),
+                Color32::from_gray(0x82),
+            );
+        };
+        let row_h = 34.0;
+        let mut y = rect.top() + 54.0;
+
+        label(y, "WINDOW");
+        y += 15.0;
+        let r1 = Rect::from_min_size(pos2(left, y), vec2(right - left, row_h));
+        if Self::switch_row(ui, r1, "on-top", "Always on top", self.settings.on_top) {
+            self.settings.on_top = !self.settings.on_top;
+            self.settings.save();
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                    if self.settings.on_top {
+                        egui::WindowLevel::AlwaysOnTop
+                    } else {
+                        egui::WindowLevel::Normal
+                    },
+                ));
+        }
+        y += row_h;
+        let r2 = Rect::from_min_size(pos2(left, y), vec2(right - left, row_h));
+        if Self::switch_row(ui, r2, "lock", "Lock position", self.settings.locked) {
+            self.settings.locked = !self.settings.locked;
+            self.settings.save();
+        }
+        y += row_h + 6.0;
+
+        label(y, "APPEARANCE");
+        y += 15.0;
+        let r3 = Rect::from_min_size(pos2(left, y), vec2(right - left, row_h));
+        painter.text(
+            r3.left_center(),
+            Align2::LEFT_CENTER,
+            "Size",
+            FontId::proportional(13.0),
+            Color32::from_gray(0xe0),
+        );
+        let seg = Rect::from_min_size(pos2(right - 156.0, r3.center().y - 15.0), vec2(156.0, 30.0));
+        painter.rect_filled(seg, Rounding::same(10.0), WELL);
+        for (n, name) in [(0u8, "Small"), (1, "Med"), (2, "Big")] {
+            let cell = Rect::from_min_size(
+                pos2(seg.left() + 2.0 + n as f32 * 51.0, seg.top() + 2.0),
+                vec2(51.0, 26.0),
+            );
+            let resp = ui
+                .interact(cell, ui.id().with(("size", n)), Sense::click())
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            let active = self.settings.size == n;
+            if active {
+                painter.rect_filled(
+                    cell,
+                    Rounding::same(8.0),
+                    Color32::from_rgb(0x3a, 0x3b, 0x3e),
+                );
+            }
+            painter.text(
+                cell.center(),
+                Align2::CENTER_CENTER,
+                name,
+                FontId::proportional(11.0),
+                if active {
+                    Color32::WHITE
+                } else if resp.hovered() {
+                    Color32::from_gray(0xc0)
+                } else {
+                    Color32::from_gray(0x8d)
+                },
+            );
+            if resp.clicked() && !active {
+                self.settings.size = n;
+                self.settings.save();
+            }
+        }
+        y += row_h + 6.0;
+
+        label(y, "WAVEFORM");
+        y += 15.0;
+        let gap = 6.0;
+        let tw = ((right - left) - gap * 4.0) / 5.0;
+        for n in 0..5u8 {
+            let tile = Rect::from_min_size(pos2(left + n as f32 * (tw + gap), y), vec2(tw, 38.0));
+            let resp = ui
+                .interact(tile, ui.id().with(("wave", n)), Sense::click())
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            painter.rect_filled(tile, Rounding::same(10.0), WELL);
+            if self.settings.wave == n {
+                painter.rect_stroke(tile, Rounding::same(10.0), Stroke::new(1.5, RED));
+            } else if resp.hovered() {
+                painter.rect_stroke(tile, Rounding::same(10.0), Stroke::new(1.0, PILL_EDGE));
+            }
+            Self::wave_thumb(&painter, tile, n);
+            if resp.clicked() {
+                self.settings.wave = n;
+                self.settings.save();
+            }
+        }
+    }
+
     fn card_rect(&self, player: Rect, dims: [f32; 2], base_h: f32) -> Rect {
         let inset = dims[1] * 0.124; // same side inset as the pill
         let (l, r) = (player.left() + inset, player.right() - inset);
@@ -1283,6 +1856,9 @@ impl Haven {
     /// playlist). Growing upward also moves the window up by the same amount and
     /// the player is drawn lower by it, so the player never moves on screen.
     fn sync_layout(&mut self, ctx: &egui::Context, dims: [f32; 2], base_h: f32) {
+        if ctx.input(|i| i.viewport().minimized.unwrap_or(false)) {
+            return; // never resize or move a minimized window
+        }
         let (mut top, mut bottom) = (0.0f32, 0.0f32);
         if self.card_visible {
             if self.card_above {
@@ -1306,26 +1882,56 @@ impl Haven {
         if !changed {
             return;
         }
-        // Wait while busy or while the user is still moving the window.
-        if self.layout_busy() || self.pos_changed.is_some() {
+        // Menu-driven changes go through immediately; only the cosmetic hover card
+        // waits for the window to settle.
+        let urgent = self.menu_rel.is_some() || self.menu_applied;
+        if !urgent && (self.layout_busy() || self.pos_changed.is_some()) {
             ctx.request_repaint_after(Duration::from_millis(120));
             return;
         }
-        let outer = ctx.input(|i| i.viewport().outer_rect);
+        // Absolute target from the remembered player position, so a stale
+        // outer_rect can never make the window drift.
+        let anchor = self.anchor.or_else(|| {
+            ctx.input(|i| i.viewport().outer_rect)
+                .map(|o| pos2(o.min.x, o.min.y + self.top_pad))
+        });
+        let Some(anchor) = anchor else {
+            return;
+        };
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(vec2(req[1], req[2])));
-        let delta = req[0] - self.req[0];
-        if delta.abs() > 0.5 {
-            if let Some(o) = outer {
-                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos2(
-                    o.min.x,
-                    o.min.y - delta,
-                )));
-            }
+        self.target_outer = None;
+        if (req[0] - self.req[0]).abs() > 0.5 {
+            let target = pos2(anchor.x, anchor.y - req[0]);
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(target));
+            self.target_outer = Some(target);
         }
         self.req = req;
         self.top_pad = req[0];
+        self.menu_applied = self.menu_rel.is_some();
         self.layout_until = Some(Instant::now() + Duration::from_millis(250));
-        ctx.request_repaint_after(Duration::from_millis(260));
+        ctx.request_repaint_after(Duration::from_millis(30));
+    }
+
+    /// The menu is only drawn once the window has really grown (or after a short
+    /// timeout), so it never appears squeezed against the old window border.
+    fn menu_ready(&self, ctx: &egui::Context) -> bool {
+        let Some(t) = self.menu_opened_at else {
+            return true;
+        };
+        if t.elapsed() > Duration::from_millis(400) {
+            return true;
+        }
+        ctx.input(|i| {
+            let v = i.viewport();
+            let size_ok = v.inner_rect.map_or(true, |r| {
+                (r.height() - self.req[2]).abs() < 2.0 && (r.width() - self.req[1]).abs() < 2.0
+            });
+            let pos_ok = match (self.target_outer, v.outer_rect) {
+                (Some(t), Some(o)) => (o.min - t).length() < 2.0,
+                _ => true,
+            };
+            size_ok && pos_ok
+        })
     }
 }
 
@@ -1348,12 +1954,14 @@ impl eframe::App for Haven {
             self.layout_until = None;
         }
         let dims = Settings::dims_for(self.settings.size);
-        let base_h = dims[1]
-            + if self.playlist_open {
-                PLAYLIST_HEIGHT + PLAYLIST_GAP
-            } else {
-                0.0
-            };
+        let panel_h = if self.playlist_open {
+            Some(PLAYLIST_HEIGHT)
+        } else if self.settings_open {
+            Some(SETTINGS_HEIGHT)
+        } else {
+            None
+        };
+        let base_h = dims[1] + panel_h.map_or(0.0, |h| h + PLAYLIST_GAP);
         let area = ctx.screen_rect();
         let player_rect = Rect::from_min_size(
             pos2(area.left(), area.top() + self.top_pad),
@@ -1361,7 +1969,7 @@ impl eframe::App for Haven {
         );
         let playlist_rect = Rect::from_min_size(
             pos2(area.left(), player_rect.bottom() + PLAYLIST_GAP),
-            vec2(dims[0], PLAYLIST_HEIGHT),
+            vec2(dims[0], panel_h.unwrap_or(PLAYLIST_HEIGHT)),
         );
 
         // Right-press opens the context menu where the pointer is.
@@ -1374,21 +1982,21 @@ impl eframe::App for Haven {
             }
         });
         if let Some(pt) = secondary {
-            if player_rect.contains(pt) || (self.playlist_open && playlist_rect.contains(pt)) {
+            if player_rect.contains(pt) || (panel_h.is_some() && playlist_rect.contains(pt)) {
                 self.open_menu(ctx, pt, player_rect.min, dims[0]);
                 opened_now = true;
             }
         }
-        // A menu left open in an unfocused window closes after 3 s.
-        if self.menu_rel.is_some() && !ctx.input(|i| i.focused) {
-            let since = self.menu_unfocused_since.get_or_insert_with(Instant::now);
-            if since.elapsed() >= Duration::from_secs(3) {
-                self.close_menu();
-            } else {
-                ctx.request_repaint_after(Duration::from_millis(100));
-            }
-        } else {
-            self.menu_unfocused_since = None;
+        // Losing focus closes the menu immediately. The first 250 ms are ignored
+        // because some systems report "unfocused" for a moment after the click.
+        if self.menu_rel.is_some()
+            && !opened_now
+            && self
+                .menu_opened_at
+                .map_or(true, |t| t.elapsed() > Duration::from_millis(250))
+            && !ctx.input(|i| i.focused)
+        {
+            self.close_menu();
         }
 
         let card_rect = self.card_rect(player_rect, dims, base_h);
@@ -1415,6 +2023,13 @@ impl eframe::App for Haven {
                             .layout(egui::Layout::top_down(egui::Align::Min)),
                     );
                     self.draw_playlist(&mut playlist_ui);
+                } else if self.settings_open {
+                    let mut settings_ui = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(playlist_rect)
+                            .layout(egui::Layout::top_down(egui::Align::Min)),
+                    );
+                    self.draw_settings(&mut settings_ui);
                 }
                 if let Some(info) = &card_info {
                     Self::paint_card(ui, card_rect, info);
@@ -1423,38 +2038,47 @@ impl eframe::App for Haven {
 
         // Context menu: its own area so it can open up or down at the click.
         if let Some(rel) = self.menu_rel {
-            let pos = pos2(player_rect.left() + rel.x, player_rect.top() + rel.y);
-            let pivot = match (self.menu_right, self.menu_up) {
-                (false, false) => Align2::LEFT_TOP,
-                (true, false) => Align2::RIGHT_TOP,
-                (false, true) => Align2::LEFT_BOTTOM,
-                (true, true) => Align2::RIGHT_BOTTOM,
-            };
-            let out = egui::Area::new(egui::Id::new("haven-context-menu"))
-                .order(egui::Order::Foreground)
-                .pivot(pivot)
-                .fixed_pos(pos)
-                .show(ctx, |ui| {
-                    egui::Frame::menu(ui.style()).show(ui, |ui| {
-                        ui.set_min_width(MENU_WIDTH - 16.0);
-                        ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
-                            self.show_context_menu(ui, ctx)
-                        });
+            if !self.menu_ready(ctx) {
+                self.menu_rect = None;
+                ctx.request_repaint_after(Duration::from_millis(16));
+            } else {
+                // Top-left is computed here (no pivot) because the size is fixed.
+                let x = player_rect.left() + rel.x - if self.menu_right { MENU_WIDTH } else { 0.0 };
+                let y = player_rect.top() + rel.y - if self.menu_up { MENU_BODY_H } else { 0.0 };
+                let out = egui::Area::new(egui::Id::new("haven-context-menu"))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(pos2(x, y))
+                    .show(ctx, |ui| {
+                        let (rect, _) =
+                            ui.allocate_exact_size(vec2(MENU_WIDTH, MENU_BODY_H), Sense::hover());
+                        self.draw_menu(ui, rect, ctx);
                     });
-                });
-            self.menu_rect = Some(out.response.rect);
-            let esc = ctx.input(|i| i.key_pressed(Key::Escape));
-            let outside = !opened_now
-                && ctx.input(|i| i.pointer.any_pressed())
-                && ctx
-                    .input(|i| i.pointer.interact_pos())
-                    .map_or(false, |p| !out.response.rect.contains(p));
-            if self.menu_close || esc || outside {
-                self.close_menu();
+                self.menu_rect = Some(out.response.rect);
+                let esc = ctx.input(|i| i.key_pressed(Key::Escape));
+                let outside = !opened_now
+                    && ctx.input(|i| i.pointer.any_pressed())
+                    && ctx
+                        .input(|i| i.pointer.interact_pos())
+                        .map_or(false, |p| !out.response.rect.contains(p));
+                if self.menu_close || esc || outside {
+                    self.close_menu();
+                }
             }
         }
 
         self.sync_layout(ctx, dims, base_h);
+        if let Some(t) = self.minimize_pending {
+            let settled = self.menu_rel.is_none()
+                && !self.layout_busy()
+                && self.req[0].abs() < 0.5
+                && (self.req[2] - base_h).abs() < 0.5;
+            if settled || t.elapsed() > Duration::from_millis(1500) {
+                self.minimize_pending = None;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(30));
+            }
+        }
         if self.engine.shared.playing.load(Relaxed) {
             ctx.request_repaint_after(Duration::from_millis(33)); // smoother waveform updates
         } else if self.drag.is_some() {
