@@ -117,6 +117,43 @@ fn scan(paths: &[PathBuf]) -> Vec<PathBuf> {
     out
 }
 
+/// Receives files from a second launch (e.g. double-clicked in Explorer while
+/// Haven is already open). A lone launch replaces the queue and plays; launches
+/// that arrive in a burst (multi-select) within 1.5 s are added to each other.
+fn spawn_ipc(listener: std::net::TcpListener, engine: Engine, ctx: egui::Context) {
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut last: Option<Instant> = None;
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else {
+                continue;
+            };
+            let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+            let mut buf = String::new();
+            let _ = (&mut s).take(1 << 20).read_to_string(&mut buf);
+            let paths: Vec<PathBuf> = buf
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(PathBuf::from)
+                .collect();
+            let q = scan(&paths);
+            if !q.is_empty() {
+                if last.map_or(false, |t| t.elapsed() < Duration::from_millis(1500)) {
+                    engine.append(q);
+                } else {
+                    engine.queue(q);
+                }
+                last = Some(Instant::now());
+            }
+            // Bring the player forward (also for a plain second launch with no files).
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            ctx.request_repaint();
+        }
+    });
+}
+
 /// Rounded-rect outline as a polyline, clockwise, starting at the left edge midpoint (9 o'clock).
 fn ring_pts(r: Rect, c: f32) -> Vec<egui::Pos2> {
     use std::f32::consts::PI;
@@ -218,7 +255,12 @@ fn fmt_time(s: f64) -> String {
 }
 
 impl Haven {
-    pub fn new(cc: &eframe::CreationContext<'_>, args: Vec<PathBuf>, settings: Settings) -> Self {
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        args: Vec<PathBuf>,
+        settings: Settings,
+        listener: std::net::TcpListener,
+    ) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
         let engine = Engine::new();
         let q = scan(&args);
@@ -230,6 +272,7 @@ impl Haven {
             engine.shared.set_vol(v); // restore the last used volume
         }
         engine.shared.set_eq(settings.eq_on, settings.eq); // restore the equalizer
+        spawn_ipc(listener, engine.clone(), cc.egui_ctx.clone()); // files from a second launch
         let updater = crate::update::Updater::new();
         updater.auto_check(); // silent, at most once a day
         Self {

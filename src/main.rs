@@ -8,7 +8,7 @@ mod settings;
 mod update;
 
 use eframe::egui;
-use std::{net::TcpListener, sync::Arc};
+use std::{net::TcpListener, path::PathBuf, sync::Arc, time::Duration};
 
 fn app_icon() -> egui::IconData {
     // assets/haven.svg rasterised to 128x128 RGBA with transparent corners
@@ -20,14 +20,40 @@ fn app_icon() -> egui::IconData {
     }
 }
 
-fn main() -> eframe::Result<()> {
-    // The bound loopback port is owned only while Haven is running. A second
-    // launch exits immediately, keeping one player instance on Windows and macOS.
-    let _single_instance = match TcpListener::bind("127.0.0.1:45831") {
-        Ok(listener) => listener,
-        Err(_) => return Ok(()),
+/// A second launch (e.g. a file double-clicked in Explorer while Haven is open)
+/// hands its files to the running instance and exits.
+fn forward_to_running(args: &[PathBuf]) {
+    use std::io::Write;
+    let addr: std::net::SocketAddr = "127.0.0.1:45831".parse().unwrap();
+    let Ok(mut s) = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2)) else {
+        return;
     };
-    let args: Vec<std::path::PathBuf> = std::env::args().skip(1).map(Into::into).collect();
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let mut msg = String::new();
+    for p in args {
+        let abs = if p.is_absolute() {
+            p.clone()
+        } else {
+            cwd.join(p)
+        };
+        msg.push_str(&abs.to_string_lossy());
+        msg.push('\n');
+    }
+    let _ = s.write_all(msg.as_bytes());
+}
+
+fn main() -> eframe::Result<()> {
+    let args: Vec<PathBuf> = std::env::args_os().skip(1).map(Into::into).collect();
+    // The bound loopback port is owned only while Haven is running. A second
+    // launch passes its files to that instance and exits, keeping one player
+    // instance on Windows and macOS.
+    let listener = match TcpListener::bind("127.0.0.1:45831") {
+        Ok(listener) => listener,
+        Err(_) => {
+            forward_to_running(&args);
+            return Ok(());
+        }
+    };
     let settings = settings::Settings::load();
     let mut vp = egui::ViewportBuilder::default()
         .with_title("Haven")
@@ -50,6 +76,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Haven",
         opts,
-        Box::new(move |cc| Ok(Box::new(app::Haven::new(cc, args, settings)))),
+        Box::new(move |cc| Ok(Box::new(app::Haven::new(cc, args, settings, listener)))),
     )
 }

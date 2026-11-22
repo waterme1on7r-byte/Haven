@@ -94,6 +94,7 @@ enum Cmd {
     Clear,
 }
 
+#[derive(Clone)]
 pub struct Engine {
     tx: Sender<Cmd>,
     pub shared: Arc<Shared>,
