@@ -1,0 +1,276 @@
+<!doctype html>
+<html lang="en" data-type="software" data-radius="soft" data-buttons="pill" data-motion>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Haven: lossless audio player for Windows and macOS</title>
+  <meta name="description" content="Haven plays local audio files in a compact desktop player with a waveform, playlist, and gapless playback.">
+  <meta name="site-kind" content="software">
+  <meta name="page-type" content="software">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="Haven: lossless audio player for Windows and macOS">
+  <meta property="og:description" content="A compact desktop player for local audio, with a waveform, playlist, and gapless playback.">
+  <meta property="og:image" content="share.jpg">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="theme-color" content="#141516">
+  <link rel="icon" href="assets/haven.svg" type="image/svg+xml">
+  <!-- <link rel="canonical" href="https://waterme1on7r-byte.github.io/Haven/"> -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Chivo:wght@400..700&family=Chivo+Mono:wght@400..500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/system.css">
+  <link rel="stylesheet" href="assets/ui/cards.css">
+  <link rel="stylesheet" href="assets/motion/motion.css">
+  <link rel="stylesheet" href="assets/backgrounds/backgrounds.css">
+  <link rel="stylesheet" href="assets/layout/layout.css">
+  <link rel="stylesheet" href="assets/icons/icon.css">
+  <style>
+    :root {
+      --p-bg: #141516; --p-surface: #292a2c; --p-ink: #efefef; --p-muted: #a3a3a3;
+      --p-accent: #ab4354; --p-accent-ink: #ffffff; --p-action: #ab4354; --p-action-ink: #ffffff;
+      --p-inv-bg: #efefef; --p-inv-surface: #dddede; --p-inv-ink: #141516; --p-inv-muted: #5e5e5f;
+      --p-inv-accent: #ab4354; --p-inv-accent-ink: #ffffff; --p-inv-action: #ab4354; --p-inv-action-ink: #ffffff;
+      --font-display: "Chivo", system-ui, sans-serif;
+      --font-text: "Chivo", system-ui, sans-serif;
+      --font-mono: "Chivo Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+      --display-weight: 400;
+      --display-tracking: -0.03em;
+      --display-tracking-xl: -0.04em;
+      --ly-scale: 0.96;
+    }
+  </style>
+  <link rel="stylesheet" href="assets/ui/base.css">
+  <link rel="stylesheet" href="assets/moments/pinned-chapters/moment.css">
+  <link rel="stylesheet" href="haven.css">
+  <script src="assets/backgrounds/backgrounds.js"></script>
+  <script>document.documentElement.classList.add('m-enter');setTimeout(()=>document.documentElement.classList.add('m-enter-done'),700)</script>
+  <script>document.documentElement.classList.add('mo-js');setTimeout(()=>document.documentElement.classList.add('mo-safe'),2500)</script>
+  <link rel="modulepreload" href="assets/moments/moments.js">
+  <link rel="modulepreload" href="assets/moments/lib.js">
+  <link rel="modulepreload" href="assets/moments/pinned-chapters/moment.js">
+</head>
+<body>
+  <header class="nav nav--centre">
+    <div class="wrap nav__bar">
+      <a class="skip-link" href="#top">Skip to content</a>
+      <a class="nav__logo" href="#top"><img class="brand-mark" src="assets/haven.svg" alt="">Haven</a>
+      <nav class="nav__links" aria-label="Main">
+        <div class="nav__item"><a class="nav__link" href="#playback">Playback</a></div>
+        <div class="nav__item"><a class="nav__link" href="#formats">Formats</a></div>
+        <div class="nav__item"><a class="nav__link" href="#controls">Shortcuts</a></div>
+        <div class="nav__item"><a class="nav__link" href="https://github.com/waterme1on7r-byte/Haven">Source</a></div>
+      </nav>
+      <div class="nav__actions">
+        <a class="btn btn--primary" href="https://github.com/waterme1on7r-byte/Haven/releases/latest">Download Haven</a>
+      </div>
+      <button class="nav__toggle" type="button" aria-expanded="false" aria-label="Menu">
+        <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true"><path d="M2 5h14M2 13h14" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <main id="top">
+    <section class="hero hero--centred" data-enter aria-labelledby="hero-h">
+      <div class="wrap">
+        <div class="hero-text">
+          <div class="hero__c">
+            <p class="hero__version">Version 0.1.7</p>
+            <h1 id="hero-h">Lossless desktop audio player</h1>
+            <p class="hero__lead">Haven plays local audio files on Windows and macOS in a compact window, with a live waveform, playlist, and gapless playback.</p>
+            <div class="btn-row">
+              <a class="btn btn--primary" href="https://github.com/waterme1on7r-byte/Haven/releases/latest">Download Haven<svg class="m-arrow" viewBox="0 0 12 12" aria-hidden="true"><path class="m-arrow__stem" d="M1 6h8"/><path class="m-arrow__head" d="M4.5 2.5 8 6l-3.5 3.5"/></svg></a>
+              <a class="link" href="https://github.com/waterme1on7r-byte/Haven">View the source</a>
+            </div>
+          </div>
+          <div class="hero__window" data-ui-pause-host>
+            <div class="player-window" role="img" aria-label="Haven player with a moving waveform, progress ring, and transport controls">
+              <div class="player-window__top" aria-hidden="true">
+                <span class="player-window__brand"><img src="assets/haven.svg" alt="">Haven</span>
+                <span class="player-window__state">Audio player</span>
+              </div>
+              <div class="player-window__wave" data-wave-loop data-m-loop aria-hidden="true">
+                <span style="--level:.24"></span><span style="--level:.48"></span><span style="--level:.33"></span><span style="--level:.66"></span>
+                <span style="--level:.41"></span><span style="--level:.72"></span><span style="--level:.52"></span><span style="--level:.86"></span>
+                <span style="--level:.58"></span><span style="--level:.36"></span><span style="--level:.67"></span><span style="--level:.44"></span>
+                <span style="--level:.93"></span><span style="--level:.62"></span><span style="--level:.4"></span><span style="--level:.75"></span>
+                <span style="--level:.52"></span><span style="--level:.82"></span><span style="--level:.47"></span><span style="--level:.68"></span>
+                <span style="--level:.34"></span><span style="--level:.78"></span><span style="--level:.55"></span><span style="--level:.9"></span>
+                <span style="--level:.4"></span><span style="--level:.65"></span><span style="--level:.5"></span><span style="--level:.8"></span>
+                <span style="--level:.42"></span><span style="--level:.72"></span><span style="--level:.35"></span><span style="--level:.6"></span>
+                <span style="--level:.88"></span><span style="--level:.48"></span><span style="--level:.74"></span><span style="--level:.38"></span>
+                <span style="--level:.64"></span><span style="--level:.52"></span><span style="--level:.86"></span><span style="--level:.32"></span>
+                <span style="--level:.68"></span><span style="--level:.44"></span><span style="--level:.94"></span><span style="--level:.58"></span>
+                <span style="--level:.36"></span><span style="--level:.76"></span><span style="--level:.5"></span><span style="--level:.65"></span>
+                <span style="--level:.4"></span><span style="--level:.82"></span><span style="--level:.54"></span><span style="--level:.7"></span>
+                <span style="--level:.36"></span><span style="--level:.62"></span><span style="--level:.46"></span><span style="--level:.8"></span>
+                <span style="--level:.42"></span><span style="--level:.72"></span><span style="--level:.3"></span><span style="--level:.58"></span>
+              </div>
+              <div class="player-window__pill">
+                <span class="player-window__transport" aria-hidden="true">
+                  <svg viewBox="0 0 20 20"><path d="M5 4v12M16 4 7 10l9 6z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>
+                </span>
+                <span class="player-window__progress" aria-hidden="true">
+                  <svg viewBox="0 0 88 88"><circle class="progress-track" cx="44" cy="44" r="39"/><circle class="progress-value" cx="44" cy="44" r="39"/></svg>
+                  <span class="player-window__play"><svg viewBox="0 0 20 20"><path d="M6 4.5v11l9-5.5z" fill="currentColor"/></svg></span>
+                </span>
+                <span class="player-window__transport" aria-hidden="true">
+                  <svg viewBox="0 0 20 20"><path d="M15 4v12M4 4l9 6-9 6z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>
+                </span>
+                <span class="player-window__divider"></span>
+                <span class="player-window__volume" aria-hidden="true">
+                  <svg viewBox="0 0 20 20"><path d="M3 8v4h3l4 3V5L6 8H3zm10-1a4 4 0 0 1 0 6m2-8a7 7 0 0 1 0 10" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="playback" data-moment="pinned-chapters" style="--h: 2; --hm: 2" aria-labelledby="playback-h">
+      <div class="wrap mo-pc__grid">
+        <div class="mo-pc__text">
+          <div class="section-head">
+            <h2 id="playback-h">Haven playback controls</h2>
+            <p>Open local audio, move through a waveform, and keep track details close to the player.</p>
+            <a class="link" href="#formats">See the supported formats</a>
+          </div>
+          <ol class="mo-pc__steps">
+            <li class="mo-pc__step">
+              <h3>Haven file import</h3>
+              <p>Open audio files or a folder, or drop them into Haven to build the playlist.</p>
+              <figure class="mo-pc__visual">
+                <div class="step-screen step-screen--files" role="img" aria-label="Haven menu with controls for opening audio files or a folder">
+                  <div class="step-screen__bar" aria-hidden="true"><img src="assets/haven.svg" alt=""><span>Haven</span><span class="step-screen__dots">•••</span></div>
+                  <div class="step-screen__menu" aria-hidden="true"><span>Open files</span><span>Open folder</span><span>Playlist</span></div>
+                </div>
+              </figure>
+            </li>
+            <li class="mo-pc__step">
+              <h3>Haven waveform seeking</h3>
+              <p>Click or drag the waveform to move through a track; use the ring to seek too.</p>
+              <figure class="mo-pc__visual">
+                <div class="step-screen step-screen--wave" role="img" aria-label="Waveform and progress ring used to seek through a track">
+                  <div class="step-screen__wave" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+                  <span class="step-screen__ring" aria-hidden="true"><span></span></span>
+                </div>
+              </figure>
+            </li>
+            <li class="mo-pc__step">
+              <h3>Haven track metadata card</h3>
+              <p>Hover over the player for a metadata card. It fades after three seconds.</p>
+              <figure class="mo-pc__visual">
+                <div class="step-screen step-screen--meta" role="img" aria-label="Metadata card displayed above the Haven player">
+                  <div class="step-screen__metadata" aria-hidden="true"><span>Track details</span><i></i><i></i><i></i></div>
+                  <div class="step-screen__mini" aria-hidden="true"><span></span><i></i><span></span></div>
+                </div>
+              </figure>
+            </li>
+          </ol>
+        </div>
+        <div class="mo-pc__visuals"></div>
+      </div>
+    </section>
+
+    <section class="section" id="formats" style="--h: 1" aria-labelledby="formats-h">
+      <div class="wrap">
+        <div class="grid">
+          <div class="section-head span-5">
+            <h2 id="formats-h">Audio formats in Haven</h2>
+            <p>Haven accepts ten file extensions in its open dialog and folder scan.</p>
+          </div>
+          <div class="formats-visual span-6 start-7" role="img" aria-label="Supported audio extensions: FLAC, M4A, MP4, WAV, AIF, AIFF, MP3, AAC, OGG, and OGA">
+            <div class="formats-visual__head" aria-hidden="true"><span>Supported files</span><span>10 formats</span></div>
+            <ul class="format-list" aria-hidden="true">
+              <li>.flac</li><li>.m4a</li><li>.mp4</li><li>.wav</li><li>.aif</li>
+              <li>.aiff</li><li>.mp3</li><li>.aac</li><li>.ogg</li><li>.oga</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="gapless" style="--h: 1" aria-labelledby="gapless-h">
+      <div class="wrap grid">
+        <div class="section-head span-5">
+          <h2 id="gapless-h">Gapless playback in Haven</h2>
+          <p>At a track’s end, the decoder opens the next file and writes to the same audio ring. The stream is rebuilt only when its sample rate changes.</p>
+          <p>Built with Rust and egui, using Symphonia to decode audio and cpal for output.</p>
+        </div>
+        <div class="flow-visual span-6 start-7" data-fx="silk-folds" data-fx-seed="420232ff" data-fx-params='{"tone":2}' role="img" aria-label="A track feeds a decoder, which opens the next file into the shared audio ring before playback reaches the output">
+          <svg class="flow-svg" viewBox="0 0 600 360" aria-hidden="true" focusable="false">
+            <path d="M170 180h50m160 0h50" fill="none" stroke="#ab4354" stroke-width="2"/>
+            <path d="m210 173 9 7-9 7m160-14 9 7-9 7" fill="none" stroke="#ab4354" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+            <rect x="20" y="72" width="150" height="216" rx="18" fill="#141516" stroke="#414245"/>
+            <rect x="225" y="72" width="150" height="216" rx="18" fill="#141516" stroke="#ab4354"/>
+            <rect x="430" y="72" width="150" height="216" rx="18" fill="#141516" stroke="#414245"/>
+            <path d="M54 178h9l12-22 14 48 14-57 14 40 14-24 13 15h8" fill="none" stroke="#a3a3a3" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+            <circle cx="300" cy="180" r="44" fill="none" stroke="#414245" stroke-width="2"/>
+            <circle cx="300" cy="180" r="33" fill="none" stroke="#ab4354" stroke-width="3" stroke-dasharray="132 76"/>
+            <path d="M281 180h10l13-18 15 36 14-22h7" fill="none" stroke="#efefef" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+            <path d="M462 171v18h14l20 16v-50l-20 16h-14zm47-7a23 23 0 0 1 0 32m12-44a39 39 0 0 1 0 56" fill="none" stroke="#a3a3a3" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="controls" style="--h: 1" aria-labelledby="controls-h">
+      <div class="wrap">
+        <div class="section-head">
+          <h2 id="controls-h">Keyboard shortcuts in Haven</h2>
+          <p>Playback shortcuts work while Haven is focused.</p>
+        </div>
+        <div class="keyboard-board" role="img" aria-label="Haven shortcuts: Space toggles playback; left and right arrows seek five seconds; Shift with arrows changes tracks; up and down change volume; M toggles mute">
+          <div class="keyboard-board__rows" aria-hidden="true">
+            <div class="keyboard-row"><kbd>Space</kbd><span>Toggle playback</span></div>
+            <div class="keyboard-row"><kbd>←</kbd><kbd>→</kbd><span>Seek five seconds</span></div>
+            <div class="keyboard-row"><kbd>Shift</kbd><kbd>←</kbd><kbd>→</kbd><span>Change tracks</span></div>
+            <div class="keyboard-row"><kbd>↑</kbd><kbd>↓</kbd><span>Change volume</span></div>
+            <div class="keyboard-row"><kbd>M</kbd><span>Toggle mute</span></div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer closing footer--dark" id="download" aria-labelledby="close-h">
+    <div class="wrap">
+      <div class="closing__cta close--type">
+        <div class="section-head">
+          <h2 id="close-h">Get Haven for desktop</h2>
+          <p>Windows and macOS downloads are on GitHub Releases.</p>
+          <p>Choose your system’s download.</p>
+        </div>
+        <a class="btn btn--primary" href="https://github.com/waterme1on7r-byte/Haven/releases/latest">Download Haven<svg class="m-arrow" viewBox="0 0 12 12" aria-hidden="true"><path class="m-arrow__stem" d="M1 6h8"/><path class="m-arrow__head" d="M4.5 2.5 8 6l-3.5 3.5"/></svg></a>
+      </div>
+      <div class="closing__links">
+        <div class="grid">
+          <div class="span-6 stack-5">
+            <a class="nav__logo" href="#top"><img class="brand-mark" src="assets/haven.svg" alt="">Haven</a>
+            <p class="footer__lede">Desktop audio player for Windows and macOS.</p>
+          </div>
+          <div class="span-3 start-7 footer__col">
+            <h3>Product</h3>
+            <ul><li><a href="#playback">Playback</a></li><li><a href="#formats">Formats</a></li><li><a href="#controls">Shortcuts</a></li></ul>
+          </div>
+          <div class="span-3 footer__col">
+            <h3>Project</h3>
+            <ul>
+              <li><a href="https://github.com/waterme1on7r-byte/Haven">Source code</a></li>
+              <li><a href="https://github.com/waterme1on7r-byte/Haven/releases/latest">Latest release</a></li>
+              <li><a href="https://github.com/waterme1on7r-byte/Haven/blob/main/README.md">README</a></li>
+              <li><a href="https://github.com/waterme1on7r-byte/Haven/issues">Issues</a></li>
+            </ul>
+          </div>
+        </div>
+        <div class="footer__legal"><span>© 2026 Haven</span><span>Desktop audio player</span></div>
+      </div>
+    </div>
+  </footer>
+
+  <script type="module" src="assets/system.js"></script>
+  <script type="module" src="assets/motion/motion.js"></script>
+  <script type="module" src="assets/layout/layout.js"></script>
+  <script type="module" src="player-motion.js"></script>
+</body>
+</html>

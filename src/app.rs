@@ -33,8 +33,9 @@ const SECS_PER_BAR: f64 = 0.125;
 const MENU_BODY_H: f32 = 244.0; // drawn height of the Mini Mixer menu
 const MENU_HEIGHT: f32 = 250.0; // window room reserved for it
 const MENU_WIDTH: f32 = 200.0;
+const SCREEN_MARGIN: f32 = 56.0; // taskbar / Dock allowance at the screen bottom
 const PLAYLIST_HEIGHT: f32 = 270.0;
-const SETTINGS_HEIGHT: f32 = 270.0;
+const SETTINGS_HEIGHT: f32 = 340.0;
 const PLAYLIST_GAP: f32 = 5.0;
 const HOVER_CARD_HEIGHT: f32 = 55.0;
 const CARD_SLOT: f32 = HOVER_CARD_HEIGHT + 4.0; // window room the card needs
@@ -51,6 +52,13 @@ pub struct Haven {
     pos_changed: Option<Instant>,
     playlist_open: bool,
     settings_open: bool,
+    panel_up: bool, // playlist/settings dock above the player instead of below
+    panel_was_open: bool,
+    updater: crate::update::Updater,
+    vol_dirty: Option<Instant>,
+    panel_applied: bool, // the last layout sent included a docked panel
+    grow_sent: Option<Instant>, // upward growth: window enlarged, move still pending
+    want_top: f32,
     // Context menu: anchored to the click, opens downward or upward.
     menu_rel: Option<egui::Vec2>, // click position relative to the player's top-left
     menu_up: bool,
@@ -58,7 +66,7 @@ pub struct Haven {
     menu_rect: Option<Rect>,
     menu_close: bool,
     menu_opened_at: Option<Instant>,
-    menu_applied: bool,         // the last layout sent included room for the menu
+    menu_applied: bool, // the last layout sent included room for the menu
     anchor: Option<egui::Pos2>, // player top-left in screen coordinates
     target_outer: Option<egui::Pos2>, // where the last layout command put the window
     minimize_pending: Option<Instant>,
@@ -191,12 +199,7 @@ fn fit(ctx: &egui::Context, text: &str, font: FontId, max_w: f32) -> String {
             hi = m - 1;
         }
     }
-    chars[..lo]
-        .iter()
-        .collect::<String>()
-        .trim_end()
-        .to_string()
-        + "…"
+    chars[..lo].iter().collect::<String>().trim_end().to_string() + "…"
 }
 
 fn fmt_time(s: f64) -> String {
@@ -213,6 +216,11 @@ impl Haven {
             engine.queue(q);
         }
         let d = settings.dims();
+        if let Some(v) = settings.volume {
+            engine.shared.set_vol(v); // restore the last used volume
+        }
+        let updater = crate::update::Updater::new();
+        updater.auto_check(); // silent, at most once a day
         Self {
             engine,
             info: None,
@@ -224,6 +232,13 @@ impl Haven {
             pos_changed: None,
             playlist_open: false,
             settings_open: false,
+            panel_up: false,
+            panel_was_open: false,
+            updater,
+            vol_dirty: None,
+            panel_applied: false,
+            grow_sent: None,
+            want_top: 0.0,
             menu_rel: None,
             menu_up: false,
             menu_right: false,
@@ -323,7 +338,7 @@ impl Haven {
         self.menu_up = match (outer, monitor) {
             (Some(o), Some(m)) => {
                 let screen_y = o.min.y + pt.y;
-                let below = m.y - screen_y - 12.0;
+                let below = m.y - screen_y - SCREEN_MARGIN;
                 let above = screen_y - 12.0;
                 below < MENU_HEIGHT && above > below
             }
@@ -337,13 +352,7 @@ impl Haven {
     }
 
     /// Round / rounded-square button face used by the Mini Mixer menu.
-    fn menu_btn(
-        ui: &mut egui::Ui,
-        rect: Rect,
-        id: &str,
-        active: bool,
-        circle: bool,
-    ) -> egui::Response {
+    fn menu_btn(ui: &mut egui::Ui, rect: Rect, id: &str, active: bool, circle: bool) -> egui::Response {
         let resp = ui
             .interact(rect, ui.id().with(id), Sense::click())
             .on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -351,10 +360,7 @@ impl Haven {
         let (fill, edge) = if active {
             (RED, RED)
         } else if resp.hovered() {
-            (
-                Color32::from_rgb(0x2b, 0x2c, 0x2f),
-                Color32::from_rgb(0x4a, 0x4b, 0x4f),
-            )
+            (Color32::from_rgb(0x2b, 0x2c, 0x2f), Color32::from_rgb(0x4a, 0x4b, 0x4f))
         } else {
             (BTN_FACE, PILL_EDGE)
         };
@@ -378,10 +384,7 @@ impl Haven {
             p.add(Shape::line(pts.iter().map(|q| pt(q.0, q.1)).collect(), st));
         };
         let closed = |pts: &[(f32, f32)]| {
-            p.add(Shape::closed_line(
-                pts.iter().map(|q| pt(q.0, q.1)).collect(),
-                st,
-            ));
+            p.add(Shape::closed_line(pts.iter().map(|q| pt(q.0, q.1)).collect(), st));
         };
         match kind {
             "prev" => {
@@ -412,14 +415,7 @@ impl Haven {
             }
             "vol" | "mute" => {
                 p.add(Shape::convex_polygon(
-                    vec![
-                        pt(-7.0, -2.5),
-                        pt(-3.5, -2.5),
-                        pt(1.0, -6.0),
-                        pt(1.0, 6.0),
-                        pt(-3.5, 2.5),
-                        pt(-7.0, 2.5),
-                    ],
+                    vec![pt(-7.0, -2.5), pt(-3.5, -2.5), pt(1.0, -6.0), pt(1.0, 6.0), pt(-3.5, 2.5), pt(-7.0, 2.5)],
                     col,
                     Stroke::NONE,
                 ));
@@ -442,23 +438,10 @@ impl Haven {
                 p.circle_filled(pt(3.0, 3.5), 2.4, col);
             }
             "file" => {
-                closed(&[
-                    (-5.0, -7.0),
-                    (1.5, -7.0),
-                    (5.5, -3.0),
-                    (5.5, 7.0),
-                    (-5.0, 7.0),
-                ]);
+                closed(&[(-5.0, -7.0), (1.5, -7.0), (5.5, -3.0), (5.5, 7.0), (-5.0, 7.0)]);
                 line(&[(1.5, -7.0), (1.5, -3.0), (5.5, -3.0)]);
             }
-            "fold" => closed(&[
-                (-7.0, -4.5),
-                (-2.0, -4.5),
-                (0.0, -2.5),
-                (7.0, -2.5),
-                (7.0, 5.0),
-                (-7.0, 5.0),
-            ]),
+            "fold" => closed(&[(-7.0, -4.5), (-2.0, -4.5), (0.0, -2.5), (7.0, -2.5), (7.0, 5.0), (-7.0, 5.0)]),
             "min" => line(&[(-6.0, 5.0), (6.0, 5.0)]),
             _ => {
                 // power
@@ -480,11 +463,7 @@ impl Haven {
         let sh = self.engine.shared.clone();
         let p = ui.painter().clone();
         let r = Rounding::same(18.0);
-        p.rect_filled(
-            rect.translate(vec2(0.0, 3.0)),
-            r,
-            Color32::from_black_alpha(70),
-        );
+        p.rect_filled(rect.translate(vec2(0.0, 3.0)), r, Color32::from_black_alpha(70));
         p.rect_filled(rect, r, PILL);
         p.rect_stroke(rect, r, Stroke::new(1.0, PILL_EDGE));
         let pad = 12.0;
@@ -508,11 +487,7 @@ impl Haven {
             &p,
             play.center(),
             if playing { "pause" } else { "play" },
-            if has_media {
-                Color32::WHITE
-            } else {
-                Color32::from_gray(0x5c)
-            },
+            if has_media { Color32::WHITE } else { Color32::from_gray(0x5c) },
         );
         if Self::menu_btn(ui, next, "next", false, false).clicked() {
             self.engine.next();
@@ -521,6 +496,14 @@ impl Haven {
 
         // ---- vertical volume fader (bottom of it toggles mute) ----
         let fader = Rect::from_min_size(pos2(left, rect.top() + pad + 52.0), vec2(34.0, 118.0));
+        // Mouse wheel anywhere on the menu changes the volume.
+        if ui.rect_contains_pointer(rect) {
+            let dy = ctx.input(|i| i.smooth_scroll_delta.y);
+            if dy.abs() > 0.01 {
+                sh.set_vol(sh.vol() + dy * 0.0015);
+                sh.muted.store(false, Relaxed);
+            }
+        }
         let muted = sh.muted.load(Relaxed);
         let vol = sh.vol().clamp(0.0, 1.0);
         let fr = Rounding::same(12.0);
@@ -528,22 +511,24 @@ impl Haven {
         let fill_h = (fader.height() * vol).max(if vol > 0.0 { 12.0 } else { 0.0 });
         if fill_h > 0.0 {
             p.rect_filled(
-                Rect::from_min_max(
-                    pos2(fader.left(), fader.bottom() - fill_h),
-                    fader.right_bottom(),
-                ),
+                Rect::from_min_max(pos2(fader.left(), fader.bottom() - fill_h), fader.right_bottom()),
                 fr,
-                if muted {
-                    Color32::from_rgb(0x5a, 0x5b, 0x5e)
-                } else {
-                    RED
-                },
+                if muted { Color32::from_rgb(0x5a, 0x5b, 0x5e) } else { RED },
             );
         }
-        let mute_zone = Rect::from_min_max(
-            pos2(fader.left(), fader.bottom() - 30.0),
-            fader.right_bottom(),
+        // level read-out at the top of the fader
+        p.text(
+            pos2(fader.center().x, fader.top() + 11.0),
+            Align2::CENTER_CENTER,
+            if muted {
+                "mute".to_string()
+            } else {
+                format!("{}", (vol * 100.0).round() as i32)
+            },
+            FontId::proportional(10.5),
+            if vol > 0.88 && !muted { Color32::WHITE } else { Color32::from_gray(0xa0) },
         );
+        let mute_zone = Rect::from_min_max(pos2(fader.left(), fader.bottom() - 30.0), fader.right_bottom());
         Self::glyph(
             &p,
             mute_zone.center(),
@@ -625,8 +610,8 @@ impl Haven {
         for (i, (id, g, tip)) in foot.iter().enumerate() {
             let c = pos2(left + 16.0 + i as f32 * 36.0, foot_y);
             let br = Rect::from_center_size(c, vec2(32.0, 32.0));
-            let resp =
-                Self::menu_btn(ui, br, id, i == 0 && self.settings_open, false).on_hover_text(*tip);
+            let resp = Self::menu_btn(ui, br, id, i == 0 && self.settings_open, false)
+                .on_hover_text(*tip);
             let ink = if i == 4 {
                 RED
             } else if i == 0 && self.settings_open {
@@ -635,6 +620,9 @@ impl Haven {
                 ICON
             };
             Self::glyph(&p, c, g, ink);
+            if i == 0 && self.updater.available() {
+                p.circle_filled(c + vec2(9.5, -9.5), 3.5, RED); // update waiting
+            }
             if resp.clicked() {
                 match i {
                     0 => {
@@ -645,10 +633,7 @@ impl Haven {
                         self.menu_close = true;
                     }
                     1 => {
-                        if let Some(f) = rfd::FileDialog::new()
-                            .add_filter("Audio", EXTS)
-                            .pick_files()
-                        {
+                        if let Some(f) = rfd::FileDialog::new().add_filter("Audio", EXTS).pick_files() {
                             self.open(f, true);
                         }
                         self.menu_close = true;
@@ -819,10 +804,7 @@ impl Haven {
             }
         }
         if wresp.clicked() {
-            if let Some(pt) = wresp
-                .interact_pointer_pos()
-                .filter(|pt| (pt.x - cx).abs() > 4.0)
-            {
+            if let Some(pt) = wresp.interact_pointer_pos().filter(|pt| (pt.x - cx).abs() > 4.0) {
                 self.engine
                     .seek((real_pos + ((pt.x - cx) / pitch) as f64 * SECS_PER_BAR).clamp(0.0, dur));
             }
@@ -888,16 +870,8 @@ impl Haven {
         }
 
         // ---- button ----
-        let hot = if has_media && btn.hovered() {
-            1.15
-        } else {
-            1.0
-        };
-        let icon_col = if has_media {
-            ICON
-        } else {
-            ICON.gamma_multiply(0.3)
-        };
+        let hot = if has_media && btn.hovered() { 1.15 } else { 1.0 };
+        let icon_col = if has_media { ICON } else { ICON.gamma_multiply(0.3) };
         p.circle(
             bc,
             r,
@@ -1012,10 +986,7 @@ impl Haven {
                         past.clone(),
                         Stroke::new(3.4, Color32::from_gray(0x5a).gamma_multiply(0.16)),
                     ));
-                    wp.add(Shape::line(
-                        past,
-                        Stroke::new(1.5, Color32::from_gray(0x78)),
-                    ));
+                    wp.add(Shape::line(past, Stroke::new(1.5, Color32::from_gray(0x78))));
                 }
                 if fut.len() > 1 {
                     wp.add(Shape::line(
@@ -1094,37 +1065,20 @@ impl Haven {
                             }
                         }
                         2 => {
-                            // Skyline: bars grow from a baseline, faint reflection below.
+                            // Skyline: single bars growing from a baseline. No reflection:
+                            // the mirrored copy read as a doubled / shuttered image.
                             let bw = pitch * 0.30;
-                            let base = well.top() + well.height() * 0.62;
-                            let up = (bw + halo * maxh * 0.66).min(well.height() * 0.56);
-                            let down = (up * 0.38).min(well.height() * 0.26);
-                            let col = ink(BAR_FUTURE, 0x62);
+                            let base = well.top() + well.height() * 0.70;
+                            let up = (bw + halo * maxh * 0.80).min(well.height() * 0.64);
                             wp.rect_filled(
-                                Rect::from_min_max(
-                                    pos2(x - bw / 2.0, base - up),
-                                    pos2(x + bw / 2.0, base),
-                                ),
+                                Rect::from_min_max(pos2(x - bw / 2.0, base - up), pos2(x + bw / 2.0, base)),
                                 Rounding {
                                     nw: bw / 2.0,
                                     ne: bw / 2.0,
-                                    sw: 0.0,
-                                    se: 0.0,
-                                },
-                                col,
-                            );
-                            wp.rect_filled(
-                                Rect::from_min_max(
-                                    pos2(x - bw / 2.0, base + 2.0),
-                                    pos2(x + bw / 2.0, base + 2.0 + down),
-                                ),
-                                Rounding {
-                                    nw: 0.0,
-                                    ne: 0.0,
                                     sw: bw / 2.0,
                                     se: bw / 2.0,
                                 },
-                                col.gamma_multiply(0.28),
+                                ink(BAR_FUTURE, 0x62),
                             );
                         }
                         _ => {
@@ -1143,10 +1097,7 @@ impl Haven {
                                     .gamma_multiply(if played { a } else { 1.0 });
                                 for sg in [-1.0f32, 1.0] {
                                     wp.rect_filled(
-                                        Rect::from_center_size(
-                                            pos2(x, mid + sg * dy),
-                                            vec2(sw, seg),
-                                        ),
+                                        Rect::from_center_size(pos2(x, mid + sg * dy), vec2(sw, seg)),
                                         sw * 0.35,
                                         col,
                                     );
@@ -1187,6 +1138,8 @@ impl Haven {
             RED,
             Stroke::NONE,
         ));
+
+
 
         // brief volume read-out after a wheel scroll
         if let Some(t) = self.vol_flash {
@@ -1487,37 +1440,43 @@ impl Haven {
             Align2::LEFT_CENTER,
             label,
             FontId::proportional(13.0),
-            if resp.hovered() {
-                Color32::WHITE
-            } else {
-                Color32::from_gray(0xe0)
-            },
+            if resp.hovered() { Color32::WHITE } else { Color32::from_gray(0xe0) },
         );
         let track = Rect::from_center_size(row.right_center() - vec2(17.0, 0.0), vec2(34.0, 18.0));
         p.rect_filled(
             track,
             Rounding::same(9.0),
-            if on {
-                RED
-            } else {
-                Color32::from_rgb(0x3a, 0x3b, 0x3e)
-            },
+            if on { RED } else { Color32::from_rgb(0x3a, 0x3b, 0x3e) },
         );
-        let kx = if on {
-            track.right() - 9.0
-        } else {
-            track.left() + 9.0
-        };
+        let kx = if on { track.right() - 9.0 } else { track.left() + 9.0 };
         p.circle_filled(
             pos2(kx, track.center().y),
             7.0,
-            if on {
-                Color32::WHITE
-            } else {
-                Color32::from_gray(0x9a)
-            },
+            if on { Color32::WHITE } else { Color32::from_gray(0x9a) },
         );
         resp.clicked()
+    }
+
+    /// Small text button used in the settings drawer.
+    fn pill_button(ui: &mut egui::Ui, rect: Rect, id: &str, text: &str, primary: bool, enabled: bool) -> bool {
+        let resp = ui.interact(rect, ui.id().with(id), Sense::click());
+        let resp = if enabled {
+            resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+        } else {
+            resp
+        };
+        let (fill, ink) = if !enabled {
+            (Color32::from_rgb(0x1f, 0x20, 0x22), Color32::from_gray(0x6a))
+        } else if primary {
+            (if resp.hovered() { Color32::from_rgb(0xe0, 0x5c, 0x6a) } else { RED }, Color32::WHITE)
+        } else if resp.hovered() {
+            (Color32::from_rgb(0x3a, 0x3b, 0x3e), Color32::WHITE)
+        } else {
+            (Color32::from_rgb(0x2f, 0x30, 0x33), Color32::from_gray(0xe0))
+        };
+        ui.painter().rect_filled(rect, Rounding::same(10.0), fill);
+        ui.painter().text(rect.center(), Align2::CENTER_CENTER, text, FontId::proportional(12.0), ink);
+        enabled && resp.clicked()
     }
 
     /// Tiny drawing of each waveform style for the picker tiles.
@@ -1532,22 +1491,14 @@ impl Haven {
             0 => {
                 for (i, v) in H.iter().enumerate() {
                     let x = left + (i as f32 + 0.5) * aw / 7.0;
-                    p.rect_filled(
-                        Rect::from_center_size(pos2(x, cy), vec2(3.0, v * maxh)),
-                        1.5,
-                        ink,
-                    );
+                    p.rect_filled(Rect::from_center_size(pos2(x, cy), vec2(3.0, v * maxh)), 1.5, ink);
                 }
             }
             1 => {
                 for i in 0..12 {
                     let v = 0.25 + 0.75 * (i as f32 * 1.7).sin().abs();
                     let x = left + (i as f32 + 0.5) * aw / 12.0;
-                    p.rect_filled(
-                        Rect::from_center_size(pos2(x, cy), vec2(1.2, v * maxh)),
-                        0.6,
-                        ink,
-                    );
+                    p.rect_filled(Rect::from_center_size(pos2(x, cy), vec2(1.2, v * maxh)), 0.6, ink);
                 }
             }
             2 => {
@@ -1567,10 +1518,7 @@ impl Haven {
                     for k in 0..((v * 4.0).round() as i32) {
                         for sg in [-1.0f32, 1.0] {
                             p.rect_filled(
-                                Rect::from_center_size(
-                                    pos2(x, cy + sg * k as f32 * 3.4),
-                                    vec2(3.0, 2.0),
-                                ),
+                                Rect::from_center_size(pos2(x, cy + sg * k as f32 * 3.4), vec2(3.0, 2.0)),
                                 0.8,
                                 ink,
                             );
@@ -1582,10 +1530,7 @@ impl Haven {
                 let pts: Vec<egui::Pos2> = (0..=24)
                     .map(|i| {
                         let t = i as f32 / 24.0;
-                        pos2(
-                            left + t * aw,
-                            cy - (t * std::f32::consts::TAU * 2.5).sin() * maxh * 0.45,
-                        )
+                        pos2(left + t * aw, cy - (t * std::f32::consts::TAU * 2.5).sin() * maxh * 0.45)
                     })
                     .collect();
                 p.add(Shape::line(pts, Stroke::new(1.4, ink)));
@@ -1623,19 +1568,13 @@ impl Haven {
         let (fill, ink) = if close_resp.hovered() {
             (Color32::from_rgb(0x43, 0x23, 0x2a), RED)
         } else {
-            (
-                Color32::from_rgb(0x18, 0x19, 0x1a),
-                Color32::from_gray(0xc8),
-            )
+            (Color32::from_rgb(0x18, 0x19, 0x1a), Color32::from_gray(0xc8))
         };
         painter.rect_filled(close, Rounding::same(10.0), fill);
         painter.rect_stroke(close, Rounding::same(10.0), Stroke::new(1.0, PILL_EDGE));
         for (a, b) in [((-4.0, -4.0), (4.0, 4.0)), ((4.0, -4.0), (-4.0, 4.0))] {
             painter.line_segment(
-                [
-                    close.center() + vec2(a.0, a.1),
-                    close.center() + vec2(b.0, b.1),
-                ],
+                [close.center() + vec2(a.0, a.1), close.center() + vec2(b.0, b.1)],
                 Stroke::new(1.8, ink),
             );
         }
@@ -1661,14 +1600,13 @@ impl Haven {
         if Self::switch_row(ui, r1, "on-top", "Always on top", self.settings.on_top) {
             self.settings.on_top = !self.settings.on_top;
             self.settings.save();
-            ui.ctx()
-                .send_viewport_cmd(egui::ViewportCommand::WindowLevel(
-                    if self.settings.on_top {
-                        egui::WindowLevel::AlwaysOnTop
-                    } else {
-                        egui::WindowLevel::Normal
-                    },
-                ));
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                if self.settings.on_top {
+                    egui::WindowLevel::AlwaysOnTop
+                } else {
+                    egui::WindowLevel::Normal
+                },
+            ));
         }
         y += row_h;
         let r2 = Rect::from_min_size(pos2(left, y), vec2(right - left, row_h));
@@ -1700,11 +1638,7 @@ impl Haven {
                 .on_hover_cursor(egui::CursorIcon::PointingHand);
             let active = self.settings.size == n;
             if active {
-                painter.rect_filled(
-                    cell,
-                    Rounding::same(8.0),
-                    Color32::from_rgb(0x3a, 0x3b, 0x3e),
-                );
+                painter.rect_filled(cell, Rounding::same(8.0), Color32::from_rgb(0x3a, 0x3b, 0x3e));
             }
             painter.text(
                 cell.center(),
@@ -1745,6 +1679,53 @@ impl Haven {
             if resp.clicked() {
                 self.settings.wave = n;
                 self.settings.save();
+            }
+        }
+        y += 38.0 + 8.0;
+
+        use crate::update::{State, Updater};
+        label(y, "UPDATES");
+        y += 15.0;
+        let r4 = Rect::from_min_size(pos2(left, y), vec2(right - left, row_h));
+        let st = self.updater.snapshot();
+        let (text, hot, btn, primary, enabled): (String, bool, &str, bool, bool) = match &st {
+            State::Idle => (format!("Haven v{}", Updater::current()), false, "Check", false, true),
+            State::Checking => ("Checking for updates…".into(), false, "…", false, false),
+            State::UpToDate => (format!("v{} · up to date", Updater::current()), false, "Check", false, true),
+            State::Available(r) => (
+                format!("Version {} is available", r.version),
+                true,
+                if r.asset_url.is_some() { "Download" } else { "Open page" },
+                true,
+                true,
+            ),
+            State::Downloading(_, d, t) => (
+                if *t > 0 {
+                    format!("Downloading… {}%", d * 100 / t)
+                } else {
+                    "Downloading…".into()
+                },
+                false,
+                "…",
+                false,
+                false,
+            ),
+            State::Downloaded(_) => ("Installer opened — quit Haven to finish".into(), true, "Open", false, true),
+            State::Failed(_) => ("Couldn't check for updates".into(), false, "Retry", false, true),
+        };
+        painter.text(
+            r4.left_center(),
+            Align2::LEFT_CENTER,
+            fit(ui.ctx(), &text, FontId::proportional(12.0), r4.width() - 108.0),
+            FontId::proportional(12.0),
+            if hot { RED } else { Color32::from_gray(0xb4) },
+        );
+        let br = Rect::from_center_size(pos2(r4.right() - 48.0, r4.center().y), vec2(96.0, 28.0));
+        if Self::pill_button(ui, br, "update-btn", btn, primary, enabled) {
+            match &st {
+                State::Available(r) => self.updater.download(r.clone()),
+                State::Downloaded(p) => crate::update::open_path_or_url(&p.to_string_lossy()),
+                _ => self.updater.check(),
             }
         }
     }
@@ -1845,7 +1826,12 @@ impl Haven {
         } else if !self.card_suppressed && self.menu_rel.is_none() && self.info.is_some() {
             let outer = ctx.input(|i| i.viewport().outer_rect);
             // Prefer above the app; go below if the screen has no room above.
-            self.card_above = outer.map_or(true, |o| o.min.y + self.top_pad >= CARD_SLOT + 8.0);
+            let panel_open = self.playlist_open || self.settings_open;
+            self.card_above = if panel_open && self.panel_up {
+                false
+            } else {
+                outer.map_or(true, |o| o.min.y + self.top_pad >= CARD_SLOT + 8.0)
+            };
             self.card_visible = true;
             self.card_last = Some(rel);
             self.card_hide_at = None;
@@ -1855,14 +1841,66 @@ impl Haven {
     /// Sizes the OS window for what is shown (card, upward/downward menu,
     /// playlist). Growing upward also moves the window up by the same amount and
     /// the player is drawn lower by it, so the player never moves on screen.
-    fn sync_layout(&mut self, ctx: &egui::Context, dims: [f32; 2], base_h: f32) {
+    /// Player and docked-panel rectangles for the current content offset.
+    fn rects(&self, area: Rect, dims: [f32; 2], panel_hh: f32) -> (Rect, Rect) {
+        let player = Rect::from_min_size(
+            pos2(area.left(), area.top() + self.top_pad),
+            vec2(dims[0], dims[1]),
+        );
+        let panel = Rect::from_min_size(
+            pos2(
+                area.left(),
+                if self.panel_up {
+                    player.top() - PLAYLIST_GAP - panel_hh
+                } else {
+                    player.bottom() + PLAYLIST_GAP
+                },
+            ),
+            vec2(dims[0], panel_hh),
+        );
+        (player, panel)
+    }
+
+    /// Chooses once, when the panel opens, whether it docks below or above the
+    /// player: below if it fits on screen, otherwise above.
+    fn decide_panel_up(&self, ctx: &egui::Context, panel_total: f32, dims: [f32; 2]) -> bool {
+        let (outer, monitor) = ctx.input(|i| {
+            let v = i.viewport();
+            (v.outer_rect, v.monitor_size)
+        });
+        // `anchor` is the player's reliable screen position, even mid-resize.
+        let ptop = self
+            .anchor
+            .map(|a| a.y)
+            .or_else(|| outer.map(|o| o.min.y + self.top_pad));
+        match (ptop, monitor) {
+            (Some(ptop), Some(m)) => {
+                let below = m.y - (ptop + dims[1]) - SCREEN_MARGIN;
+                let above = ptop - 8.0;
+                below < panel_total && above > below
+            }
+            _ => false,
+        }
+    }
+
+    /// Sizes and positions the OS window for what is shown (card, menu, panel).
+    ///
+    /// It runs BEFORE drawing, and every change of the content offset is made in
+    /// the same frame as the window move, so the player never appears displaced:
+    ///  * growing upward: first enlarge the window downward (invisible), then move
+    ///    it up and shift the content together;
+    ///  * shrinking: move the window down and shift the content together first,
+    ///    and only then cut the transparent leftover.
+    fn sync_layout(&mut self, ctx: &egui::Context, dims: [f32; 2], panel_total: f32) {
         if ctx.input(|i| i.viewport().minimized.unwrap_or(false)) {
             return; // never resize or move a minimized window
         }
-        let (mut top, mut bottom) = (0.0f32, 0.0f32);
+        // Height from the player's top down; a panel docked above adds to `top`.
+        let base_h = dims[1] + if self.panel_up { 0.0 } else { panel_total };
+        let (mut top, mut bottom) = (if self.panel_up { panel_total } else { 0.0 }, 0.0f32);
         if self.card_visible {
             if self.card_above {
-                top = CARD_SLOT;
+                top = top.max(CARD_SLOT);
             } else {
                 bottom = CARD_SLOT;
             }
@@ -1874,17 +1912,17 @@ impl Haven {
                 bottom = bottom.max((rel.y + MENU_HEIGHT - base_h).max(0.0));
             }
         }
-        let req = [top, dims[0], top + base_h + bottom];
-        let changed = req
-            .iter()
-            .zip(self.req.iter())
-            .any(|(a, b)| (a - b).abs() > 0.5);
-        if !changed {
+        let want = [top, dims[0], top + base_h + bottom];
+        self.want_top = want[0];
+        if want.iter().zip(self.req.iter()).all(|(a, b)| (a - b).abs() <= 0.5) {
             return;
         }
-        // Menu-driven changes go through immediately; only the cosmetic hover card
+        // Menu / panel changes go through at once; only the cosmetic hover card
         // waits for the window to settle.
-        let urgent = self.menu_rel.is_some() || self.menu_applied;
+        let urgent = self.menu_rel.is_some()
+            || self.menu_applied
+            || panel_total > 0.0
+            || self.panel_applied;
         if !urgent && (self.layout_busy() || self.pos_changed.is_some()) {
             ctx.request_repaint_after(Duration::from_millis(120));
             return;
@@ -1898,16 +1936,52 @@ impl Haven {
         let Some(anchor) = anchor else {
             return;
         };
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(vec2(req[1], req[2])));
-        self.target_outer = None;
-        if (req[0] - self.req[0]).abs() > 0.5 {
-            let target = pos2(anchor.x, anchor.y - req[0]);
+        self.menu_applied = self.menu_rel.is_some();
+        self.panel_applied = panel_total > 0.0;
+        let top_delta = want[0] - self.req[0];
+
+        if top_delta > 0.5 {
+            // Phase 1: make the window tall enough first (no visible change).
+            if (self.req[1] - want[1]).abs() > 0.5 || (self.req[2] - want[2]).abs() > 0.5 {
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(vec2(want[1], want[2])));
+                self.req[1] = want[1];
+                self.req[2] = want[2];
+                self.grow_sent = Some(Instant::now());
+                ctx.request_repaint_after(Duration::from_millis(16));
+                return;
+            }
+            let big_enough = ctx
+                .input(|i| i.viewport().inner_rect)
+                .map_or(true, |r| r.height() >= want[2] - 1.5);
+            let waited = self
+                .grow_sent
+                .map_or(true, |t| t.elapsed() > Duration::from_millis(300));
+            if !(big_enough || waited) {
+                ctx.request_repaint_after(Duration::from_millis(16));
+                return;
+            }
+            // Phase 2: shift the content and move the window in this same frame.
+            self.top_pad = want[0];
+            self.req[0] = want[0];
+            self.grow_sent = None;
+            let target = pos2(anchor.x, anchor.y - want[0]);
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(target));
             self.target_outer = Some(target);
+        } else if top_delta < -0.5 {
+            // Phase A: shift the content and move the window down together; the
+            // window stays tall for now and shrinks on a following frame.
+            self.top_pad = want[0];
+            self.req[0] = want[0];
+            let target = pos2(anchor.x, anchor.y - want[0]);
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(target));
+            self.target_outer = Some(target);
+        } else {
+            // Size only (bottom room, width): the top-left stays put, nothing jumps.
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(vec2(want[1], want[2])));
+            self.req[1] = want[1];
+            self.req[2] = want[2];
+            self.target_outer = None;
         }
-        self.req = req;
-        self.top_pad = req[0];
-        self.menu_applied = self.menu_rel.is_some();
         self.layout_until = Some(Instant::now() + Duration::from_millis(250));
         ctx.request_repaint_after(Duration::from_millis(30));
     }
@@ -1930,14 +2004,14 @@ impl Haven {
                 (Some(t), Some(o)) => (o.min - t).length() < 2.0,
                 _ => true,
             };
-            size_ok && pos_ok
+            size_ok && pos_ok && (self.req[0] - self.want_top).abs() < 0.5
         })
     }
 }
 
 impl eframe::App for Haven {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        if self.pos_changed.is_some() {
+        if self.pos_changed.is_some() || self.vol_dirty.is_some() {
             self.settings.save();
         }
     }
@@ -1961,16 +2035,17 @@ impl eframe::App for Haven {
         } else {
             None
         };
-        let base_h = dims[1] + panel_h.map_or(0.0, |h| h + PLAYLIST_GAP);
+        let panel_total = panel_h.map_or(0.0, |h| h + PLAYLIST_GAP);
+        if panel_h.is_some() && !self.panel_was_open {
+            self.panel_up = self.decide_panel_up(ctx, panel_total, dims);
+        }
+        self.panel_was_open = panel_h.is_some();
+        let panel_up_h = if self.panel_up { panel_total } else { 0.0 };
+        // height from the player's top downwards (a panel above is not part of it)
+        let base_h = dims[1] + if self.panel_up { 0.0 } else { panel_total };
         let area = ctx.screen_rect();
-        let player_rect = Rect::from_min_size(
-            pos2(area.left(), area.top() + self.top_pad),
-            vec2(dims[0], dims[1]),
-        );
-        let playlist_rect = Rect::from_min_size(
-            pos2(area.left(), player_rect.bottom() + PLAYLIST_GAP),
-            vec2(dims[0], panel_h.unwrap_or(PLAYLIST_HEIGHT)),
-        );
+        let panel_hh = panel_h.unwrap_or(PLAYLIST_HEIGHT);
+        let (player_rect, playlist_rect) = self.rects(area, dims, panel_hh);
 
         // Right-press opens the context menu where the pointer is.
         let mut opened_now = false;
@@ -2003,6 +2078,12 @@ impl eframe::App for Haven {
         self.update_card(ctx, player_rect, card_rect);
         let show_card = self.card_visible && self.menu_rel.is_none();
         let card_info = if show_card { self.info.clone() } else { None };
+
+        // Window move/resize happens here, BEFORE drawing, so the content offset
+        // and the window geometry change in the same frame (no one-frame jump).
+        self.sync_layout(ctx, dims, panel_total);
+        let (player_rect, playlist_rect) = self.rects(area, dims, panel_hh);
+        let card_rect = self.card_rect(player_rect, dims, base_h);
 
         egui::CentralPanel::default()
             .frame(egui::Frame::none())
@@ -2049,8 +2130,8 @@ impl eframe::App for Haven {
                     .order(egui::Order::Foreground)
                     .fixed_pos(pos2(x, y))
                     .show(ctx, |ui| {
-                        let (rect, _) =
-                            ui.allocate_exact_size(vec2(MENU_WIDTH, MENU_BODY_H), Sense::hover());
+                        let (rect, _) = ui
+                            .allocate_exact_size(vec2(MENU_WIDTH, MENU_BODY_H), Sense::hover());
                         self.draw_menu(ui, rect, ctx);
                     });
                 self.menu_rect = Some(out.response.rect);
@@ -2066,12 +2147,28 @@ impl eframe::App for Haven {
             }
         }
 
-        self.sync_layout(ctx, dims, base_h);
+        // Remember the volume (written 600 ms after the last change).
+        let vnow = self.engine.shared.vol();
+        if self.settings.volume.map_or(true, |v| (v - vnow).abs() > 0.004) {
+            self.settings.volume = Some(vnow);
+            self.vol_dirty = Some(Instant::now());
+        }
+        if let Some(t) = self.vol_dirty {
+            if t.elapsed() >= Duration::from_millis(600) {
+                self.settings.save();
+                self.vol_dirty = None;
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(650));
+            }
+        }
+        if self.updater.busy() {
+            ctx.request_repaint_after(Duration::from_millis(250));
+        }
         if let Some(t) = self.minimize_pending {
             let settled = self.menu_rel.is_none()
                 && !self.layout_busy()
-                && self.req[0].abs() < 0.5
-                && (self.req[2] - base_h).abs() < 0.5;
+                && (self.req[0] - panel_up_h).abs() < 0.5
+                && (self.req[2] - (panel_up_h + base_h)).abs() < 0.5;
             if settled || t.elapsed() > Duration::from_millis(1500) {
                 self.minimize_pending = None;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));

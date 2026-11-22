@@ -5,6 +5,7 @@ mod engine;
 mod meta;
 mod reader;
 mod settings;
+mod update;
 
 use eframe::egui;
 use std::{net::TcpListener, sync::Arc};

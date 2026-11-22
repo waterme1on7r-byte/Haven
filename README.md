@@ -2,6 +2,10 @@
 
 Minimal lossless desktop player. Rust · egui (glow) · symphonia · cpal.
 
+## Website
+
+The Haven landing page is published on [GitHub Pages](https://waterme1on7r-byte.github.io/Haven/). Its source lives in `site/`; `.github/workflows/pages.yml` deploys that folder.
+
 ## Build & run
 
 ### Windows 10/11
@@ -28,7 +32,7 @@ Minimal lossless desktop player. Rust · egui (glow) · symphonia · cpal.
 Installers can be built locally with `cargo install cargo-packager --locked` followed by
 `cargo packager --release`. Windows produces an NSIS setup `.exe`; macOS produces a `.dmg`.
 The GitHub Actions workflow builds both formats on their native runners and uploads them as
-workflow artifacts. Pushing a version tag such as `v0.1.6` also publishes the installers as a
+workflow artifacts. Pushing a version tag such as `v0.1.7` also publishes the installers as a
 GitHub release. macOS packages are unsigned until a Developer ID certificate and notarization
 are configured.
 
@@ -74,3 +78,15 @@ Open the app itself (Haven.app), not the `haven` file inside `Contents/MacOS`. I
 - Mouse wheel over the waveform changes volume (nowhere else); a short read-out shows the level.
 - The play button and Space are disabled while nothing is loaded.
 - The context menu closes immediately when the window loses focus, and Minimize waits until the window has shrunk back so it restores in the right place.
+- Skyline has no reflection (it looked like a doubled image).
+- Playlist and Settings dock below the player, or above it when the screen has too little room below (decided when they open; the player never moves).
+
+## Updates (GitHub Releases)
+1. `src/update.rs` checks releases from `waterme1on7r-byte/Haven`.
+2. Bump `version` in `Cargo.toml` (currently 0.1.7), commit, then push a matching tag, e.g. `v0.1.8` for the next release. CI refuses to build a tag that differs from the Cargo version and attaches the Windows installer (.exe) and macOS disk image (.dmg) to the release.
+3. Running copies check shortly after launch (at most once a day) and via Settings → Updates → Check. When a newer release exists, the Settings icon in the context menu gets a red dot; "Download" saves the installer to your Downloads folder and opens it. Haven never replaces itself, so quit the app to finish installing.
+
+The repository must be public (or the release assets reachable without a token) for the check to work.
+
+## Volume
+The last used volume is saved (600 ms after the last change) and restored on launch. Scrolling over the waveform or over the context menu changes it; the menu fader shows the level as a number.

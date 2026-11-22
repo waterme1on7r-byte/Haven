@@ -1,6 +1,6 @@
 [package]
 name = "haven"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 
 [dependencies]
@@ -11,6 +11,8 @@ rtrb      = "0.3"                                      # lock-free ring buffer d
 lofty     = "0.21"                                     # tags + stream properties
 rfd       = "0.15"                                     # native open dialogs
 anyhow    = "1"
+ureq      = { version = "2", features = ["json"] }   # GitHub Releases update check/download
+serde_json = "1"
 
 [build-dependencies]
 winres = "0.1"

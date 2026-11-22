@@ -11,6 +11,8 @@ pub struct Settings {
     pub size: u8,
     /// Waveform style 0..=4.
     pub wave: u8,
+    /// Last used volume 0..=1 (None = never changed).
+    pub volume: Option<f32>,
 }
 
 impl Default for Settings {
@@ -21,8 +23,14 @@ impl Default for Settings {
             pos: None,
             size: 2,
             wave: 0,
+            volume: None,
         }
     }
+}
+
+/// The Haven settings folder.
+pub fn config_dir() -> Option<PathBuf> {
+    path().and_then(|p| p.parent().map(|d| d.to_path_buf()))
 }
 
 fn path() -> Option<PathBuf> {
@@ -63,6 +71,11 @@ impl Settings {
                         if let Some(v) = l.strip_prefix("y=") {
                             y = v.parse::<f32>().ok();
                         }
+                        if let Some(v) = l.strip_prefix("volume=") {
+                            if let Ok(n) = v.parse::<f32>() {
+                                s.volume = Some(n.clamp(0.0, 1.0));
+                            }
+                        }
                         if let Some(v) = l.strip_prefix("wave=") {
                             if let Ok(n) = v.parse::<u8>() {
                                 s.wave = n.min(4);
@@ -95,6 +108,9 @@ impl Settings {
                 "on_top={}\nlocked={}\nsize={}\nwave={}\n",
                 self.on_top as u8, self.locked as u8, self.size, self.wave
             );
+            if let Some(v) = self.volume {
+                t += &format!("volume={v:.3}\n");
+            }
             if let Some((x, y)) = self.pos {
                 t += &format!("x={x}\ny={y}\n");
             }
