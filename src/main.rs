@@ -2,41 +2,62 @@
 
 mod app;
 mod engine;
+#[cfg(target_os = "macos")]
+mod macos_open;
 mod meta;
 mod reader;
 mod settings;
+mod update;
 
 use eframe::egui;
-use std::sync::Arc;
+use std::{net::TcpListener, path::PathBuf, sync::Arc, time::Duration};
 
 fn app_icon() -> egui::IconData {
-    let (w, h) = (64u32, 64u32);
-    let mut rgba = vec![0u8; (w * h * 4) as usize];
-    let heights = [14usize, 21, 29, 38, 48, 58, 48, 38, 29, 21, 14];
-    for (i, bar_h) in heights.into_iter().enumerate() {
-        let x0 = 7 + i * 5;
-        let y0 = 57 - bar_h;
-        let color = match i {
-            0..=4 => [0xD0, 0xD0, 0xD0, 0xFF],
-            5 => [0xD0, 0x50, 0x5E, 0xFF],
-            _ => [0xF2, 0xF2, 0xF2, 0xFF],
-        };
-        for y in y0..57 {
-            for x in x0..(x0 + 4) {
-                let n = (y * w as usize + x) * 4;
-                rgba[n..n + 4].copy_from_slice(&color);
-            }
-        }
-    }
+    // assets/haven.svg rasterised to 128x128 RGBA with transparent corners
+    // (regenerate assets/haven-128.rgba whenever the SVG changes).
     egui::IconData {
-        rgba,
-        width: w,
-        height: h,
+        rgba: include_bytes!("../assets/haven-128.rgba").to_vec(),
+        width: 128,
+        height: 128,
     }
 }
 
+/// A second launch (e.g. a file double-clicked in Explorer while Haven is open)
+/// hands its files to the running instance and exits.
+fn forward_to_running(args: &[PathBuf]) {
+    use std::io::Write;
+    let addr: std::net::SocketAddr = "127.0.0.1:45831".parse().unwrap();
+    let Ok(mut s) = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2)) else {
+        return;
+    };
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let mut msg = String::new();
+    for p in args {
+        let abs = if p.is_absolute() {
+            p.clone()
+        } else {
+            cwd.join(p)
+        };
+        msg.push_str(&abs.to_string_lossy());
+        msg.push('\n');
+    }
+    let _ = s.write_all(msg.as_bytes());
+}
+
 fn main() -> eframe::Result<()> {
-    let args: Vec<std::path::PathBuf> = std::env::args().skip(1).map(Into::into).collect();
+    #[cfg(target_os = "macos")]
+    macos_open::install_early(); // before the event loop installs its delegate
+    let args: Vec<PathBuf> = std::env::args_os().skip(1).map(Into::into).collect();
+    // The bound loopback port is owned only while Haven is running. A second
+    // launch passes its files to that instance and exits, keeping one player
+    // instance on Windows and macOS.
+    let listener = match TcpListener::bind("127.0.0.1:45831") {
+        Ok(listener) => listener,
+        Err(_) => {
+            forward_to_running(&args);
+            return Ok(());
+        }
+    };
     let settings = settings::Settings::load();
     let mut vp = egui::ViewportBuilder::default()
         .with_title("Haven")
@@ -59,6 +80,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Haven",
         opts,
-        Box::new(move |cc| Ok(Box::new(app::Haven::new(cc, args, settings)))),
+        Box::new(move |cc| Ok(Box::new(app::Haven::new(cc, args, settings, listener)))),
     )
 }
