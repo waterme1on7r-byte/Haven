@@ -23,18 +23,107 @@ jobs:
             label: Windows installer
             artifact: Haven-Windows
           - runner: macos-latest
-            format: dmg
+            format: app
             label: macOS disk image
             artifact: Haven-macOS
     steps:
       - name: Check out source
         uses: actions/checkout@v4
+      - name: Check tag matches Cargo version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          # The in-app updater compares the release tag with this version.
+          v=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
+          [ "v$v" = "${GITHUB_REF_NAME}" ] || { echo "Tag ${GITHUB_REF_NAME} != Cargo version v$v"; exit 1; }
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
+      - name: Install macOS Rust targets
+        if: matrix.runner == 'macos-latest'
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
       - name: Install packager
         run: cargo install cargo-packager --locked
-      - name: Build package
+      - name: Build Windows package
+        if: matrix.runner == 'windows-latest'
         run: cargo packager --release --formats ${{ matrix.format }}
+      - name: Build macOS package
+        if: matrix.runner == 'macos-latest'
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "12.0"
+        run: cargo packager --release --formats ${{ matrix.format }}
+      - name: Build Universal 2 macOS executable
+        if: matrix.runner == 'macos-latest'
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "12.0"
+        run: |
+          case "$(uname -m)" in
+            arm64)
+              host_target=aarch64-apple-darwin
+              other_target=x86_64-apple-darwin
+              ;;
+            x86_64)
+              host_target=x86_64-apple-darwin
+              other_target=aarch64-apple-darwin
+              ;;
+            *)
+              echo "Unsupported macOS runner architecture: $(uname -m)" >&2
+              exit 1
+              ;;
+          esac
+
+          cargo build --release --target "$host_target"
+          cargo build --release --target "$other_target"
+
+          executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' dist/Haven.app/Contents/Info.plist)"
+          lipo -create \
+            "target/$host_target/release/$executable" \
+            "target/$other_target/release/$executable" \
+            -output "dist/Haven.app/Contents/MacOS/$executable"
+          lipo -verify_arch arm64 x86_64 "dist/Haven.app/Contents/MacOS/$executable"
+          file "dist/Haven.app/Contents/MacOS/$executable"
+      - name: Declare supported audio types (macOS)
+        if: matrix.runner == 'macos-latest'
+        run: |
+          # Keep the source ICNS inside the bundle and point LaunchServices at it.
+          cp assets/haven.icns dist/Haven.app/Contents/Resources/haven.icns
+          # Without CFBundleDocumentTypes macOS will not list Haven under
+          # "Open With" and refuses audio files ("cannot open ... format").
+          python3 - <<'PY'
+          import plistlib
+          p = "dist/Haven.app/Contents/Info.plist"
+          with open(p, "rb") as f:
+              d = plistlib.load(f)
+          d["LSMinimumSystemVersion"] = "12.0"
+          d["CFBundleIconFile"] = "haven.icns"
+          d["CFBundleDocumentTypes"] = [{
+              "CFBundleTypeName": "Audio",
+              "CFBundleTypeRole": "Viewer",
+              "LSHandlerRank": "Alternate",
+              "LSItemContentTypes": [
+                  "public.audio", "public.mp3", "org.xiph.flac",
+                  "com.microsoft.waveform-audio", "public.aiff-audio",
+                  "public.aifc-audio", "com.apple.m4a-audio",
+                  "public.mpeg-4-audio",
+              ],
+              "CFBundleTypeExtensions": [
+                  "mp3", "flac", "wav", "aif", "aiff", "m4a", "aac",
+                  "ogg", "oga",
+              ],
+          }]
+          with open(p, "wb") as f:
+              plistlib.dump(d, f)
+          PY
+          plutil -p dist/Haven.app/Contents/Info.plist
+      - name: Sign app and build DMG (macOS)
+        if: matrix.runner == 'macos-latest'
+        run: |
+          # Sign AFTER stripping/bundling so the signature is valid, then
+          # verify it. The DMG is built from the already-signed app.
+          codesign --force --deep --sign - dist/Haven.app
+          codesign --verify --deep --strict --verbose=2 dist/Haven.app
+          file dist/Haven.app/Contents/MacOS/*
+          hdiutil create -volname Haven -srcfolder dist/Haven.app -ov -format UDZO dist/Haven.dmg
+          rm -rf dist/Haven.app
       - name: Upload package artifact
         uses: actions/upload-artifact@v4
         with:
