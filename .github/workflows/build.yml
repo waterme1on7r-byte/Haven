@@ -79,7 +79,10 @@ jobs:
             "target/$host_target/release/$executable" \
             "target/$other_target/release/$executable" \
             -output "dist/Haven.app/Contents/MacOS/$executable"
-          lipo -verify_arch arm64 x86_64 "dist/Haven.app/Contents/MacOS/$executable"
+          architectures="$(lipo -archs "dist/Haven.app/Contents/MacOS/$executable")"
+          echo "Universal 2 architectures: $architectures"
+          grep -qw arm64 <<< "$architectures"
+          grep -qw x86_64 <<< "$architectures"
           file "dist/Haven.app/Contents/MacOS/$executable"
       - name: Declare supported audio types (macOS)
         if: matrix.runner == 'macos-latest'
