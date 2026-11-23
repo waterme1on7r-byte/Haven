@@ -45,6 +45,8 @@ fn forward_to_running(args: &[PathBuf]) {
 }
 
 fn main() -> eframe::Result<()> {
+    #[cfg(target_os = "macos")]
+    macos_open::install_early(); // before the event loop installs its delegate
     let args: Vec<PathBuf> = std::env::args_os().skip(1).map(Into::into).collect();
     // The bound loopback port is owned only while Haven is running. A second
     // launch passes its files to that instance and exits, keeping one player

@@ -6,13 +6,16 @@
 //! runtime and hand the paths to the same loopback channel that a second launch
 //! uses on Windows (see `spawn_ipc` in app.rs). No extra crates are needed.
 //!
-//! Limitation: this is installed once the window exists, so it covers opening a
-//! file while Haven is already running. A file that *launches* Haven cold opens
-//! the (empty) player; double-click the file again once it is up.
+//! The handler has to exist before AppKit delivers the open event, which on a
+//! cold launch happens before the window is created. So `install_early` hooks
+//! `-[NSApplication setDelegate:]` and adds `application:openFiles:` to whatever
+//! delegate winit installs, the moment it is installed.
 
 use std::ffi::{c_char, c_void, CStr};
 use std::io::Write;
 use std::net::{SocketAddr, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Once;
 use std::time::Duration;
 
 type Id = *mut c_void;
@@ -25,7 +28,12 @@ extern "C" {
     fn object_getClass(obj: Id) -> Id;
     fn class_addMethod(cls: Id, name: Sel, imp: *const c_void, types: *const c_char) -> u8;
     fn objc_msgSend();
+    fn class_getInstanceMethod(cls: Id, name: Sel) -> *mut c_void;
+    fn method_setImplementation(m: *mut c_void, imp: *const c_void) -> *const c_void;
 }
+
+static ORIG_SET_DELEGATE: AtomicUsize = AtomicUsize::new(0);
+static HOOK: Once = Once::new();
 
 unsafe fn sel(name: &CStr) -> Sel {
     sel_registerName(name.as_ptr())
@@ -90,9 +98,52 @@ extern "C" fn open_files(_this: Id, _cmd: Sel, app: Id, files: Id) {
     });
 }
 
-/// Adds `application:openFiles:` to the running app delegate. Call on the main
-/// thread after the event loop has installed its delegate (e.g. from the
-/// eframe creation callback).
+unsafe fn add_open_method(cls: Id) {
+    if cls.is_null() {
+        return;
+    }
+    // Returns NO (harmlessly) when the class already has the method.
+    class_addMethod(
+        cls,
+        sel(c"application:openFiles:"),
+        open_files as *const c_void,
+        c"v@:@@".as_ptr(),
+    );
+}
+
+/// Replacement for `-[NSApplication setDelegate:]`: run the original, then give
+/// the new delegate's class the open-files method.
+extern "C" fn set_delegate(this: Id, cmd: Sel, delegate: Id) {
+    unsafe {
+        let orig = ORIG_SET_DELEGATE.load(Ordering::SeqCst);
+        if orig != 0 {
+            let f: extern "C" fn(Id, Sel, Id) = std::mem::transmute(orig);
+            f(this, cmd, delegate);
+        }
+        if !delegate.is_null() {
+            add_open_method(object_getClass(delegate));
+        }
+    }
+}
+
+/// Call once at the very start of `main`, before the event loop is created.
+pub fn install_early() {
+    HOOK.call_once(|| unsafe {
+        let cls = objc_getClass(c"NSApplication".as_ptr());
+        if cls.is_null() {
+            return;
+        }
+        let m = class_getInstanceMethod(cls, sel(c"setDelegate:"));
+        if m.is_null() {
+            return;
+        }
+        let old = method_setImplementation(m, set_delegate as *const c_void);
+        ORIG_SET_DELEGATE.store(old as usize, Ordering::SeqCst);
+    });
+}
+
+/// Fallback: adds the method to the current delegate if the early hook missed
+/// it (call from the eframe creation callback).
 pub fn install() {
     unsafe {
         let app = msg_id(
@@ -103,15 +154,8 @@ pub fn install() {
             return;
         }
         let delegate = msg_id(app, c"delegate");
-        if delegate.is_null() {
-            return;
+        if !delegate.is_null() {
+            add_open_method(object_getClass(delegate));
         }
-        let cls = object_getClass(delegate);
-        class_addMethod(
-            cls,
-            sel(c"application:openFiles:"),
-            open_files as *const c_void,
-            c"v@:@@".as_ptr(),
-        );
     }
 }
