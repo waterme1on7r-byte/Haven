@@ -67,6 +67,10 @@ fn main() -> eframe::Result<()> {
         .with_transparent(true)
         .with_drag_and_drop(true)
         .with_icon(Arc::new(app_icon()));
+    #[cfg(target_os = "macos")]
+    if settings.size == 3 {
+        vp = vp.with_visible(false);
+    }
     if settings.on_top {
         vp = vp.with_always_on_top();
     }

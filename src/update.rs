@@ -36,7 +36,7 @@ pub enum State {
     /// Installer handed to the helper script; Haven is about to quit and restart.
     Installing,
     /// Automatic install was not possible; the installer was opened for the user.
-    Downloaded(PathBuf),
+    Downloaded(PathBuf, String),
     /// Short reason; `Some(release)` when it was the download/install that failed.
     Failed(String, Option<Release>),
 }
@@ -215,7 +215,7 @@ impl Updater {
             Err(e) => {
                 eprintln!("haven: automatic install unavailable: {e}");
                 open_path_or_url(&path.to_string_lossy());
-                self.set(State::Downloaded(path));
+                self.set(State::Downloaded(path, e.to_string()));
             }
         }
     }

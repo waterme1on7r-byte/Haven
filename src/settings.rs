@@ -1,4 +1,4 @@
-//! Tiny persisted settings (two flags) in the platform config folder. No dependencies.
+//! Persisted player and appearance settings in the platform config folder. No dependencies.
 use std::path::PathBuf;
 
 #[derive(Clone, Copy)]
@@ -7,7 +7,7 @@ pub struct Settings {
     pub locked: bool,
     /// Window outer position in points (x, y).
     pub pos: Option<(f32, f32)>,
-    /// 0 = small, 1 = medium, 2 = big (default, the original size).
+    /// 0 = small, 1 = medium, 2 = big, 3 = macOS Menu Bar layout.
     pub size: u8,
     /// Waveform style 0..=4.
     pub wave: u8,
@@ -56,6 +56,8 @@ impl Settings {
         match n {
             0 => [378.0, 126.0],
             1 => [504.0, 168.0],
+            #[cfg(target_os = "macos")]
+            3 => [350.0, 300.0],
             _ => [630.0, 210.0],
         }
     }
@@ -96,7 +98,7 @@ impl Settings {
                         }
                         if let Some(v) = l.strip_prefix("size=") {
                             if let Ok(n) = v.parse::<u8>() {
-                                s.size = n.min(2);
+                                s.size = n.min(if cfg!(target_os = "macos") { 3 } else { 2 });
                             }
                         }
                     }

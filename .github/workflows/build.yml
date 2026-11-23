@@ -87,6 +87,8 @@ jobs:
       - name: Declare supported audio types (macOS)
         if: matrix.runner == 'macos-latest'
         run: |
+          # Keep the source ICNS inside the bundle and point LaunchServices at it.
+          cp assets/haven.icns dist/Haven.app/Contents/Resources/haven.icns
           # Without CFBundleDocumentTypes macOS will not list Haven under
           # "Open With" and refuses audio files ("cannot open ... format").
           python3 - <<'PY'
@@ -95,6 +97,7 @@ jobs:
           with open(p, "rb") as f:
               d = plistlib.load(f)
           d["LSMinimumSystemVersion"] = "12.0"
+          d["CFBundleIconFile"] = "haven.icns"
           d["CFBundleDocumentTypes"] = [{
               "CFBundleTypeName": "Audio",
               "CFBundleTypeRole": "Viewer",

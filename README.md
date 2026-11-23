@@ -35,14 +35,18 @@ Installers can be built locally with `cargo install cargo-packager --locked` fol
 The GitHub Actions workflow builds both formats on their native runners and uploads them as
 workflow artifacts. Its macOS DMG contains a Universal 2 app for Intel and Apple silicon, with a
 macOS 12.0 minimum deployment target; this includes macOS Ventura 13. Pushing a version tag such
-as `v0.1.10` also publishes the installers as a GitHub release. macOS packages are ad-hoc signed
+as `v0.1.12` also publishes the installers as a GitHub release. macOS packages are ad-hoc signed
 but not notarized until a Developer ID certificate and notarization are configured.
+On macOS, Haven disables the native window shadow because the transparent player draws its own
+shadow and the system shadow can leave ghosting artifacts during waveform animation. Settings →
+Size → Menu Bar switches Haven to a real status item beside the system icons, hides the player
+window and Dock icon, and provides playback controls plus Show Haven and Quit Haven menu items.
 
 ## Controls
 Space play/pause · ←/→ seek 5 s · Shift+←/→ prev/next · ↑/↓ volume · M mute · E equalizer on/off
 Drag on waveform to scrub · click waveform to jump · right-click waveform for the transport menu
 Progress ring (#ab4354) around the pill: click or drag it to seek, hover for elapsed / total time
-Right-click menu ("Mini Mixer"): prev / play-pause / next, a vertical volume fader (tap its speaker to mute), Shuffle / Repeat (cycles off → all → one) / Playlist chips, and an icon footer for Settings, Open files, Open folder, Minimize, Exit. Settings… opens a drawer under the player (same slot as the playlist) with Always on top, Lock position, Size (Small / Med / Big) and Wave style (5 live thumbnails); these are remembered between launches, along with the window position
+Right-click menu ("Mini Mixer"): prev / play-pause / next, a vertical volume fader (tap its speaker to mute), Shuffle / Repeat (cycles off → all → one) / Playlist chips, and an icon footer for Settings, Open files, Open folder, Minimize, Exit. Settings… opens a drawer under the player (same slot as the playlist) with Always on top, Lock position, Size (Small / Med / Big; macOS also has Menu Bar) and Wave style (5 live thumbnails); these are remembered between launches, along with the window position
 Window: drag the top-edge grip, the frame around the pill (or the gap inside the ring), or hold Alt/Option and drag anywhere. The right-click menu opens at the pointer, downward or — when the screen has too little room below — upward; the player itself never moves.
 The playlist opens as a panel attached below the player; it moves with the player and rows select tracks.
 Drop files/folders (or Open…) to add them to the playlist — what is playing keeps playing · Playlist → Clear empties the list but keeps the current track playing
@@ -84,17 +88,20 @@ Open the app itself (Haven.app), not the `haven` file inside `Contents/MacOS`. I
 - Right-clicking the waveform only opens the menu; it never scrubs or seeks (a seek flushes the audio buffer and is audible). Left-click/drag still seeks.
 - Mouse wheel over the waveform changes volume (nowhere else); a short read-out shows the level.
 - The play button and Space are disabled while nothing is loaded. After the last track ends, one press of play restarts the queue (the window keeps repainting briefly after input so the button never shows a stale state).
+- At the end of the queue, the play button switches to Play as soon as the decoder reaches EOF, while the audio callback drains its final buffer. One click restarts the queue.
+- Playlist, Settings, and Equalizer panels close after the Haven window stays unfocused for 10 seconds. The timer resets when Haven regains focus.
+- Controls ignore the activation click when Haven was unfocused; hover feedback remains visible.
 - The hover card goes above the player, or above the Playlist/Settings panel when that panel is docked upward.
 - The context menu closes immediately when the window loses focus, and Minimize waits until the window has shrunk back so it restores in the right place.
 - Skyline bars stand on a baseline with a short, faded reflection underneath. Wave is a single smooth sine whose height follows loudness. No bar animates on its own: heights come only from the audio.
-- Output device: Haven follows the system's default output device. Switch to headphones (or unplug / change the output in the OS) while playing and the sound moves over within about a second, resuming from the same point. If the device in use disappears, Haven reopens on the new default.
+- Output device: Haven follows the system's default output device. Switch to headphones (or unplug / change the output in the OS) while playing and Haven reopens on the new default within a few hundred milliseconds, resuming from the same point. If the device in use disappears, Haven retries the new default.
 - Play/pause sends an explicit target state, not a flip, so extra clicks while the engine is busy cannot cancel each other. At the end of the queue the last ~300 ms plays out without blocking, so a click right after the end restarts the queue immediately.
 - Settings shows a small "WTMLJR" signature at the bottom.
 - Playlist and Settings dock below the player, or above it when the screen has too little room below (decided when they open; the player never moves).
 
 ## Updates (GitHub Releases)
 1. `REPO` in `src/update.rs` is `waterme1on7r-byte/Haven`.
-2. Bump `version` in `Cargo.toml` (currently 0.1.10), commit, then push a tag that matches it, e.g. `v0.1.11` for the next release. CI refuses to build a tag that differs from the Cargo version and attaches the Windows installer (.exe) and macOS disk image (.dmg) to the release.
+2. Bump `version` in `Cargo.toml` (currently 0.1.12), commit, then push a tag that matches it, e.g. `v0.1.13` for the next release. CI refuses to build a tag that differs from the Cargo version and attaches the Windows installer (.exe) and macOS disk image (.dmg) to the release.
 3. Running copies check shortly after launch (at most once a day) and via Settings → Updates → Check. When a newer release exists, the Settings icon in the context menu gets a red dot and the Updates row offers **Update**. One click does everything: it downloads the installer (with progress), verifies the size, quits Haven, installs silently and starts the new version.
    - Windows: the NSIS installer is per-user (no administrator prompt) and is run with `/S`. A helper script waits for Haven to exit first, then relaunches Haven.
    - macOS: the helper copies the new Haven.app out of the disk image over the running bundle and reopens it. If that is not possible (no permission, or not running from an .app) it reopens the old app and shows the disk image so you can drag it over yourself.

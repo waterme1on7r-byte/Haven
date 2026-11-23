@@ -27,12 +27,17 @@ extern "C" {
     fn sel_registerName(name: *const c_char) -> Sel;
     fn object_getClass(obj: Id) -> Id;
     fn class_addMethod(cls: Id, name: Sel, imp: *const c_void, types: *const c_char) -> u8;
+    fn objc_allocateClassPair(superclass: Id, name: *const c_char, extra: usize) -> Id;
+    fn objc_registerClassPair(cls: Id);
     fn objc_msgSend();
     fn class_getInstanceMethod(cls: Id, name: Sel) -> *mut c_void;
     fn method_setImplementation(m: *mut c_void, imp: *const c_void) -> *const c_void;
 }
 
 static ORIG_SET_DELEGATE: AtomicUsize = AtomicUsize::new(0);
+static STATUS_ITEM: AtomicUsize = AtomicUsize::new(0);
+static STATUS_TARGET: AtomicUsize = AtomicUsize::new(0);
+static MENU_READY: Once = Once::new();
 static HOOK: Once = Once::new();
 
 unsafe fn sel(name: &CStr) -> Sel {
@@ -67,6 +72,179 @@ unsafe fn msg_void_isize(obj: Id, name: &CStr, arg: isize) {
     let f: unsafe extern "C" fn(Id, Sel, isize) =
         std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
     f(obj, sel(name), arg)
+}
+
+unsafe fn msg_void_bool(obj: Id, name: &CStr, arg: i8) {
+    let f: unsafe extern "C" fn(Id, Sel, i8) =
+        std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+    f(obj, sel(name), arg)
+}
+
+unsafe fn msg_void_id(obj: Id, name: &CStr, arg: Id) {
+    let f: unsafe extern "C" fn(Id, Sel, Id) =
+        std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+    f(obj, sel(name), arg)
+}
+
+unsafe fn ns_string(text: &str) -> Id {
+    let Ok(text) = std::ffi::CString::new(text) else {
+        return std::ptr::null_mut();
+    };
+    let f: unsafe extern "C" fn(Id, Sel, *const c_char) -> Id =
+        std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+    f(
+        objc_getClass(c"NSString".as_ptr()),
+        sel(c"stringWithUTF8String:"),
+        text.as_ptr(),
+    )
+}
+
+unsafe fn status_command(name: &str) {
+    let addr: SocketAddr = "127.0.0.1:45831".parse().unwrap();
+    if let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(250)) {
+        let _ = stream.write_all(format!("@HAVEN:{name}\n").as_bytes());
+    }
+}
+
+extern "C" fn status_play(_this: Id, _cmd: Sel, _sender: Id) {
+    unsafe { status_command("PLAY") }
+}
+extern "C" fn status_prev(_this: Id, _cmd: Sel, _sender: Id) {
+    unsafe { status_command("PREV") }
+}
+extern "C" fn status_next(_this: Id, _cmd: Sel, _sender: Id) {
+    unsafe { status_command("NEXT") }
+}
+extern "C" fn status_show(_this: Id, _cmd: Sel, _sender: Id) {
+    unsafe { status_command("SHOW") }
+}
+extern "C" fn status_quit(_this: Id, _cmd: Sel, _sender: Id) {
+    unsafe { status_command("QUIT") }
+}
+
+unsafe fn status_target() -> Id {
+    MENU_READY.call_once(|| unsafe {
+        let superclass = objc_getClass(c"NSObject".as_ptr());
+        let cls = objc_allocateClassPair(superclass, c"HavenStatusBarTarget".as_ptr(), 0);
+        if cls.is_null() {
+            return;
+        }
+        for (selector, callback) in [
+            (c"play:", status_play as *const c_void),
+            (c"previous:", status_prev as *const c_void),
+            (c"next:", status_next as *const c_void),
+            (c"showHaven:", status_show as *const c_void),
+            (c"quitHaven:", status_quit as *const c_void),
+        ] {
+            class_addMethod(cls, sel(selector), callback, c"v@:@".as_ptr());
+        }
+        objc_registerClassPair(cls);
+    });
+    let existing = STATUS_TARGET.load(Ordering::SeqCst) as Id;
+    if !existing.is_null() {
+        return existing;
+    }
+    let cls = objc_getClass(c"HavenStatusBarTarget".as_ptr());
+    if cls.is_null() {
+        return std::ptr::null_mut();
+    }
+    let target = msg_id(cls, c"new");
+    STATUS_TARGET.store(target as usize, Ordering::SeqCst);
+    target
+}
+
+unsafe fn make_status_menu_item(menu: Id, target: Id, title: &str, action: &CStr) {
+    let alloc = msg_id(objc_getClass(c"NSMenuItem".as_ptr()), c"alloc");
+    let init: unsafe extern "C" fn(Id, Sel, Id, Sel, Id) -> Id =
+        std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+    let item = init(
+        alloc,
+        sel(c"initWithTitle:action:keyEquivalent:"),
+        ns_string(title),
+        sel(action),
+        ns_string(""),
+    );
+    if item.is_null() {
+        return;
+    }
+    msg_void_id(item, c"setTarget:", target);
+    let add: unsafe extern "C" fn(Id, Sel, Id) =
+        std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+    add(menu, sel(c"addItem:"), item);
+}
+
+unsafe fn create_status_item() {
+    if !(STATUS_ITEM.load(Ordering::SeqCst) as Id).is_null() {
+        return;
+    }
+    let bar = msg_id(objc_getClass(c"NSStatusBar".as_ptr()), c"systemStatusBar");
+    if bar.is_null() {
+        return;
+    }
+    let create: unsafe extern "C" fn(Id, Sel, f64) -> Id =
+        std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+    let item = create(bar, sel(c"statusItemWithLength:"), -1.0);
+    if item.is_null() {
+        return;
+    }
+    STATUS_ITEM.store(item as usize, Ordering::SeqCst);
+    let button = msg_id(item, c"button");
+    if !button.is_null() {
+        msg_void_id(button, c"setTitle:", ns_string(""));
+        let symbol: unsafe extern "C" fn(Id, Sel, Id, Id) -> Id =
+            std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        let image = symbol(
+            objc_getClass(c"NSImage".as_ptr()),
+            sel(c"imageWithSystemSymbolName:accessibilityDescription:"),
+            ns_string("waveform"),
+            ns_string("Haven"),
+        );
+        if !image.is_null() {
+            msg_void_id(button, c"setImage:", image);
+            msg_void_bool(image, c"setTemplate:", 1);
+        } else {
+            msg_void_id(button, c"setTitle:", ns_string("♫"));
+        }
+        msg_void_id(button, c"setToolTip:", ns_string("Haven"));
+    }
+    let menu = msg_id(objc_getClass(c"NSMenu".as_ptr()), c"new");
+    let target = status_target();
+    if menu.is_null() || target.is_null() {
+        return;
+    }
+    make_status_menu_item(menu, target, "Play / Pause", c"play:");
+    make_status_menu_item(menu, target, "Previous", c"previous:");
+    make_status_menu_item(menu, target, "Next", c"next:");
+    let separator = msg_id(objc_getClass(c"NSMenuItem".as_ptr()), c"separatorItem");
+    let add: unsafe extern "C" fn(Id, Sel, Id) =
+        std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+    add(menu, sel(c"addItem:"), separator);
+    make_status_menu_item(menu, target, "Show Haven…", c"showHaven:");
+    make_status_menu_item(menu, target, "Quit Haven", c"quitHaven:");
+    msg_void_id(item, c"setMenu:", menu);
+}
+
+/// Enable/disable the true macOS menu bar extra and hide Haven from the Dock.
+pub fn set_menu_bar_mode(enabled: bool) {
+    unsafe {
+        let app = msg_id(
+            objc_getClass(c"NSApplication".as_ptr()),
+            c"sharedApplication",
+        );
+        if app.is_null() {
+            return;
+        }
+        msg_void_isize(app, c"setActivationPolicy:", if enabled { 1 } else { 0 });
+        if enabled {
+            create_status_item();
+        } else {
+            let item = STATUS_ITEM.swap(0, Ordering::SeqCst) as Id;
+            if !item.is_null() {
+                let bar = msg_id(objc_getClass(c"NSStatusBar".as_ptr()), c"systemStatusBar");
+                msg_void_id(bar, c"removeStatusItem:", item);
+            }
+        }
+    }
 }
 
 /// `- (void)application:(NSApplication *)app openFiles:(NSArray<NSString *> *)files`
@@ -156,6 +334,19 @@ pub fn install() {
         let delegate = msg_id(app, c"delegate");
         if !delegate.is_null() {
             add_open_method(object_getClass(delegate));
+        }
+
+        // Haven draws its own shadow inside a transparent, borderless window.
+        // AppKit's native shadow can leave ghost copies while the animated
+        // waveform repaints the window, so disable it for the player window.
+        let windows = msg_id(app, c"windows");
+        if !windows.is_null() {
+            for i in 0..msg_usize(windows, c"count") {
+                let window = msg_id_usize(windows, c"objectAtIndex:", i);
+                if !window.is_null() {
+                    msg_void_bool(window, c"setHasShadow:", 0);
+                }
+            }
         }
     }
 }

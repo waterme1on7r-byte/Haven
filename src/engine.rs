@@ -24,6 +24,9 @@ use std::{
 
 pub struct Shared {
     pub playing: AtomicBool,
+    /// True after the final track reached EOF, separate from the output state
+    /// while the callback drains its last buffered samples.
+    pub queue_ended: AtomicBool,
     pub pos_ms: AtomicU64,
     pub dur_ms: AtomicU64,
     vol: AtomicU32,
@@ -55,6 +58,7 @@ impl Shared {
     fn new() -> Self {
         Self {
             playing: AtomicBool::new(false),
+            queue_ended: AtomicBool::new(false),
             pos_ms: AtomicU64::new(0),
             dur_ms: AtomicU64::new(0),
             vol: AtomicU32::new(1.0f32.to_bits()),
@@ -125,7 +129,7 @@ impl Engine {
             .name("haven-devwatch".into())
             .spawn(move || loop {
                 w.default_dev.store(default_dev_id(), Relaxed);
-                thread::sleep(Duration::from_millis(500));
+                thread::sleep(Duration::from_millis(200));
             });
         Self { tx, shared }
     }
@@ -143,7 +147,7 @@ impl Engine {
     /// explicit target. Extra clicks while the engine is busy can no longer cancel
     /// each other out.
     pub fn toggle(&self) {
-        let want = !self.shared.playing.load(Relaxed);
+        let want = self.shared.queue_ended.load(Relaxed) || !self.shared.playing.load(Relaxed);
         self.shared.playing.store(want, Relaxed);
         let _ = self.tx.send(Cmd::Play(want));
     }
@@ -425,6 +429,7 @@ impl Core {
                 if empty || t.elapsed() > Duration::from_secs(2) {
                     self.tail = None;
                     self.sh.playing.store(false, Relaxed);
+                    self.sh.queue_ended.store(true, Relaxed);
                 }
             }
             let mut worked = false;
@@ -450,6 +455,7 @@ impl Core {
                 }
                 *self.sh.queue_info.lock().unwrap() = p.iter().map(|p| meta::read(p)).collect();
                 self.queue = p;
+                self.sh.queue_ended.store(false, Relaxed);
                 self.sh.playing.store(true, Relaxed);
                 self.start_from(s.min(self.queue.len() - 1), false);
             }
@@ -462,12 +468,14 @@ impl Core {
                     .extend(p.iter().map(|p| meta::read(p)));
                 self.queue.extend(p);
                 if self.reader.is_none() && self.queue.len() > old {
+                    self.sh.queue_ended.store(false, Relaxed);
                     self.sh.playing.store(true, Relaxed);
                     self.start_from(old, false);
                 }
             }
             Cmd::Select(i) => {
                 if i < self.queue.len() {
+                    self.sh.queue_ended.store(false, Relaxed);
                     self.sh.playing.store(true, Relaxed);
                     self.start_from(i, false);
                 }
@@ -478,6 +486,7 @@ impl Core {
                     if self.queue.is_empty() {
                         self.sh.playing.store(false, Relaxed);
                     } else {
+                        self.sh.queue_ended.store(false, Relaxed);
                         self.sh.playing.store(true, Relaxed);
                         self.start_from(0, false);
                     }
@@ -488,6 +497,7 @@ impl Core {
             Cmd::Play(false) => self.sh.playing.store(false, Relaxed),
             Cmd::Next => {
                 if let Some(i) = self.next_idx(false) {
+                    self.sh.queue_ended.store(false, Relaxed);
                     self.sh.playing.store(true, Relaxed);
                     self.start_from(i, false);
                 }
@@ -502,6 +512,7 @@ impl Core {
                         self.idx - 1
                     };
                     self.sh.playing.store(true, Relaxed);
+                    self.sh.queue_ended.store(false, Relaxed);
                     self.start_from(i, false);
                 }
             }
@@ -573,6 +584,7 @@ impl Core {
 
     fn start_from(&mut self, mut idx: usize, gapless: bool) {
         self.tail = None;
+        self.sh.queue_ended.store(false, Relaxed);
         for _ in 0..self.queue.len() {
             if self.start(idx, gapless) {
                 self.idx = idx;
@@ -675,6 +687,7 @@ impl Core {
             None => {
                 // Let the last ~300 ms play out, but do not block this thread meanwhile:
                 // clicks that arrive now are handled at once (see `tail` in `run`).
+                self.sh.queue_ended.store(true, Relaxed);
                 self.tail = Some(Instant::now());
             }
         }
@@ -694,7 +707,7 @@ impl Core {
         if Instant::now() < self.dev_retry {
             return;
         }
-        self.dev_retry = Instant::now() + Duration::from_millis(1000);
+        self.dev_retry = Instant::now() + Duration::from_millis(250);
         let rate = o.rate;
         let pos = self.sh.pos_ms.load(Relaxed) as f64 / 1000.0;
         match open_out(rate, &self.sh) {
