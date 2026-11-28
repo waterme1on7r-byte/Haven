@@ -42,6 +42,19 @@ const PLAYLIST_GAP: f32 = 5.0;
 const HOVER_CARD_HEIGHT: f32 = 55.0;
 const CARD_SLOT: f32 = HOVER_CARD_HEIGHT + 4.0; // window room the card needs
 const CARD_HIDE_AFTER: Duration = Duration::from_secs(3);
+/// Drawers (playlist / settings / equalizer) are never narrower than this, so the
+/// extra-small player (narrower than the settings rows) can still open them.
+const MIN_PANEL_W: f32 = 378.0;
+
+/// Window size at launch. On macOS the window permanently includes the strip the
+/// hover card is drawn in (see `Haven::card_reserve`).
+pub fn initial_window_size(settings: &Settings) -> [f32; 2] {
+    let mut d = settings.dims();
+    if cfg!(target_os = "macos") && settings.size != 3 {
+        d[1] += CARD_SLOT;
+    }
+    d
+}
 
 pub struct Haven {
     engine: Engine,
@@ -285,6 +298,29 @@ impl Haven {
         cfg!(target_os = "macos") && self.settings.size == 3
     }
 
+    /// Extra window height kept below the player for the hover card on macOS.
+    ///
+    /// Resizing a transparent window every time the card appears or disappears (which
+    /// also happens on every click and drag, since a press hides the card) makes the
+    /// whole player flash on macOS. With this room always present the window geometry
+    /// never changes for the card; the strip is fully transparent, so it is click-through.
+    fn card_reserve(&self) -> f32 {
+        if cfg!(target_os = "macos") && !self.menu_bar_mode() {
+            CARD_SLOT
+        } else {
+            0.0
+        }
+    }
+
+    /// Width of the window and of docked drawers.
+    fn panel_width(&self, dims: [f32; 2]) -> f32 {
+        if self.menu_bar_mode() {
+            dims[0]
+        } else {
+            dims[0].max(MIN_PANEL_W)
+        }
+    }
+
     fn playlist_height(&self) -> f32 {
         if self.menu_bar_mode() {
             MENU_BAR_PLAYLIST_HEIGHT
@@ -318,7 +354,7 @@ impl Haven {
         if !q.is_empty() {
             engine.queue(q);
         }
-        let d = settings.dims();
+        let d = initial_window_size(&settings);
         if let Some(v) = settings.volume {
             engine.shared.set_vol(v); // restore the last used volume
         }
@@ -2528,9 +2564,15 @@ impl Haven {
             Color32::from_gray(0xe0),
         );
         #[cfg(target_os = "macos")]
-        let size_options = [(0u8, "Small"), (1, "Med"), (2, "Big"), (3, "Menu Bar")];
+        let size_options = [
+            (4u8, "X-Small"),
+            (0, "Small"),
+            (1, "Med"),
+            (2, "Big"),
+            (3, "Menu Bar"),
+        ];
         #[cfg(not(target_os = "macos"))]
-        let size_options = [(0u8, "Small"), (1, "Med"), (2, "Big")];
+        let size_options = [(4u8, "X-Small"), (0, "Small"), (1, "Med"), (2, "Big")];
         let cell_w = if cfg!(target_os = "macos") {
             54.0
         } else {
@@ -2539,9 +2581,9 @@ impl Haven {
         let seg_w = cell_w * size_options.len() as f32 + 4.0;
         let seg = Rect::from_min_size(pos2(right - seg_w, r3.center().y - 15.0), vec2(seg_w, 30.0));
         painter.rect_filled(seg, Rounding::same(10.0), WELL);
-        for &(n, name) in &size_options {
+        for (slot, &(n, name)) in size_options.iter().enumerate() {
             let cell = Rect::from_min_size(
-                pos2(seg.left() + 2.0 + n as f32 * cell_w, seg.top() + 2.0),
+                pos2(seg.left() + 2.0 + slot as f32 * cell_w, seg.top() + 2.0),
                 vec2(cell_w, 26.0),
             );
             let resp = ui
@@ -3159,7 +3201,9 @@ impl Haven {
                 0.0
             };
             let ptop = outer.map(|o| o.min.y + self.top_pad);
-            let room_above = ptop.map_or(true, |y| y - up >= CARD_SLOT + 8.0);
+            // macOS keeps its card room below the player (see `card_reserve`).
+            let room_above = !cfg!(target_os = "macos")
+                && ptop.map_or(true, |y| y - up >= CARD_SLOT + 8.0);
             let room_below = match (ptop, monitor) {
                 (Some(y), Some(m)) => {
                     let below_panel = if self.panel_up {
@@ -3199,7 +3243,7 @@ impl Haven {
                     player.bottom() + PLAYLIST_GAP
                 },
             ),
-            vec2(dims[0], panel_hh),
+            vec2(self.panel_width(dims), panel_hh),
         );
         (player, panel)
     }
@@ -3240,8 +3284,9 @@ impl Haven {
         }
         // Height from the player's top down; a panel docked above adds to `top`.
         let base_h = dims[1] + if self.panel_up { 0.0 } else { panel_total };
-        let (mut top, mut bottom) = (if self.panel_up { panel_total } else { 0.0 }, 0.0f32);
-        if self.card_visible {
+        let reserve = self.card_reserve();
+        let (mut top, mut bottom) = (if self.panel_up { panel_total } else { 0.0 }, reserve);
+        if reserve == 0.0 && self.card_visible {
             if self.card_above {
                 top += CARD_SLOT; // above the player, or above an upward panel
             } else {
@@ -3255,7 +3300,12 @@ impl Haven {
                 bottom = bottom.max((rel.y + MENU_HEIGHT - base_h).max(0.0));
             }
         }
-        let want = [top, dims[0], top + base_h + bottom];
+        let width = if panel_total > 0.0 {
+            self.panel_width(dims)
+        } else {
+            dims[0]
+        };
+        let want = [top, width, top + base_h + bottom];
         self.want_top = want[0];
         if want
             .iter()
@@ -3560,7 +3610,7 @@ impl eframe::App for Haven {
             let settled = self.menu_rel.is_none()
                 && !self.layout_busy()
                 && (self.req[0] - panel_up_h).abs() < 0.5
-                && (self.req[2] - (panel_up_h + base_h)).abs() < 0.5;
+                && (self.req[2] - (panel_up_h + base_h + self.card_reserve())).abs() < 0.5;
             if settled || t.elapsed() > Duration::from_millis(1500) {
                 self.minimize_pending = None;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));

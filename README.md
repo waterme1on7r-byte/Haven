@@ -31,18 +31,24 @@ Installers can be built locally with `cargo install cargo-packager --locked` fol
 The GitHub Actions workflow builds both formats on their native runners and uploads them as
 workflow artifacts. Its macOS DMG contains a Universal 2 app for Intel and Apple silicon, with a
 macOS 12.0 minimum deployment target; this includes macOS Ventura 13. Pushing a version tag such
-as `v0.1.13` also publishes the installers as a GitHub release. macOS packages are ad-hoc signed
+as `v0.1.14` also publishes the installers as a GitHub release. macOS packages are ad-hoc signed
 but not notarized until a Developer ID certificate and notarization are configured.
 On macOS, Haven disables the native window shadow because the transparent player draws its own
 shadow and the system shadow can leave ghosting artifacts during waveform animation. Settings →
 Size → Menu Bar switches Haven to a real status item beside the system icons, hides the player
 window and Dock icon, and provides playback controls plus Show Haven and Quit Haven menu items.
 
+## macOS notes (hover card, menu bar, icon, DMG)
+- The window keeps a permanent transparent strip below the player for the hover metadata card, so showing or hiding the card (and therefore every click and drag) never resizes or moves the window; resizing a transparent window made the player flash on macOS. The strip is click-through, and the card always appears below the player on macOS.
+- The Menu Bar status item is retained by Haven (AppKit does not keep it alive) and uses the `music.note` SF Symbol, falling back to a ♫ title.
+- CI builds `Haven.icns` with `iconutil` from `assets/haven.iconset`, removes any icon the packager generated and sets `CFBundleIconFile` to `Haven`.
+- The DMG contains `Haven.app` and an `Applications` shortcut for drag-to-install.
+
 ## Controls
 Space play/pause · ←/→ seek 5 s · Shift+←/→ prev/next · ↑/↓ volume · M mute · E equalizer on/off
 Drag on waveform to scrub · click waveform to jump · right-click waveform for the transport menu
 Progress ring (#ab4354) around the pill: click or drag it to seek, hover for elapsed / total time
-Right-click menu ("Mini Mixer"): prev / play-pause / next, a vertical volume fader (tap its speaker to mute), Shuffle / Repeat (cycles off → all → one) / Playlist chips, and an icon footer for Settings, Open files, Open folder, Minimize, Exit. Settings… opens a drawer under the player (same slot as the playlist) with Always on top, Lock position, Size (Small / Med / Big; macOS also has Menu Bar) and Wave style (5 live thumbnails); these are remembered between launches, along with the window position
+Right-click menu ("Mini Mixer"): prev / play-pause / next, a vertical volume fader (tap its speaker to mute), Shuffle / Repeat (cycles off → all → one) / Playlist chips, and an icon footer for Settings, Open files, Open folder, Minimize, Exit. Settings… opens a drawer under the player (same slot as the playlist) with Always on top, Lock position, Size (X-Small / Small / Med / Big; macOS also has Menu Bar) and Wave style (5 live thumbnails); these are remembered between launches, along with the window position
 Window: drag the top-edge grip, the frame around the pill (or the gap inside the ring), or hold Alt/Option and drag anywhere. The right-click menu opens at the pointer, downward or — when the screen has too little room below — upward; the player itself never moves.
 The playlist opens as a panel attached below the player; it moves with the player and rows select tracks.
 Drop files/folders (or Open…) to add them to the playlist — what is playing keeps playing · Playlist → Clear empties the list but keeps the current track playing
@@ -70,7 +76,7 @@ is only rebuilt when the sample rate changes.
 - Album art is read by lofty but not shown (design has no slot for it).
 
 ## Icon
-`assets/haven.svg` is the single source. The `.ico`, `.icns`, `haven.iconset/*.png` and `haven-128.rgba` (window icon, embedded in the binary) are rasterised from it with fully transparent corners. Re-export all of them if the SVG changes.
+`assets/haven.svg` is the single source. The `.ico`, `.icns`, `haven.iconset/*.png` and `haven-128.rgba` (window icon, embedded in the binary) are rasterised from it with fully transparent corners. Re-export all of them if the SVG changes. The macOS artwork (`haven.iconset/*`, `haven.icns`, `haven-256-mac.rgba`) is the same design scaled to 824/1024 and centred with a soft shadow, matching Apple's icon grid so it is not oversized next to other apps; the Windows `.ico` and `haven-128.rgba` stay full-bleed.
 
 ## macOS: "haven is damaged and can't be opened"
 CI ad-hoc signs and verifies the app (no Apple Developer account, so no notarization). An app with no valid signature is reported as "damaged" on Apple Silicon; Gatekeeper may still flag browser downloads. Drag Haven.app to Applications, then run once in Terminal:
@@ -97,7 +103,7 @@ Open the app itself (Haven.app), not the `haven` file inside `Contents/MacOS`. I
 
 ## Updates (GitHub Releases)
 1. `REPO` in `src/update.rs` is `waterme1on7r-byte/Haven`.
-2. Bump `version` in `Cargo.toml` (currently 0.1.13), commit, then push a tag that matches it, e.g. `v0.1.14` for the next release. CI refuses to build a tag that differs from the Cargo version and attaches the Windows installer (.exe) and macOS disk image (.dmg) to the release.
+2. Bump `version` in `Cargo.toml` (currently 0.1.14), commit, then push a tag that matches it, e.g. `v0.1.15` for the next release. CI refuses to build a tag that differs from the Cargo version and attaches the Windows installer (.exe) and macOS disk image (.dmg) to the release.
 3. Running copies check shortly after launch (at most once a day) and via Settings → Updates → Check. When a newer release exists, the Settings icon in the context menu gets a red dot and the Updates row offers **Update**. One click does everything: it downloads the installer (with progress), verifies the size, quits Haven, installs silently and starts the new version.
    - Windows: the NSIS installer is per-user (no administrator prompt) and is run with `/S`. A helper script waits for Haven to exit first, then relaunches Haven.
    - macOS: the helper copies the new Haven.app out of the disk image over the running bundle and reopens it. If that is not possible (no permission, or not running from an .app) it reopens the old app and shows the disk image so you can drag it over yourself.

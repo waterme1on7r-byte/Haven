@@ -13,12 +13,24 @@ use eframe::egui;
 use std::{net::TcpListener, path::PathBuf, sync::Arc, time::Duration};
 
 fn app_icon() -> egui::IconData {
-    // assets/haven.svg rasterised to 128x128 RGBA with transparent corners
-    // (regenerate assets/haven-128.rgba whenever the SVG changes).
-    egui::IconData {
-        rgba: include_bytes!("../assets/haven-128.rgba").to_vec(),
-        width: 128,
-        height: 128,
+    // assets/haven.svg rasterised with transparent corners (regenerate the .rgba files
+    // whenever the SVG changes). macOS draws its own icons inside an ~80% safe area, and
+    // eframe also uses this image as the Dock icon, so macOS gets a padded version.
+    #[cfg(target_os = "macos")]
+    {
+        egui::IconData {
+            rgba: include_bytes!("../assets/haven-256-mac.rgba").to_vec(),
+            width: 256,
+            height: 256,
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        egui::IconData {
+            rgba: include_bytes!("../assets/haven-128.rgba").to_vec(),
+            width: 128,
+            height: 128,
+        }
     }
 }
 
@@ -61,8 +73,8 @@ fn main() -> eframe::Result<()> {
     let settings = settings::Settings::load();
     let mut vp = egui::ViewportBuilder::default()
         .with_title("Haven")
-        .with_inner_size(settings.dims())
-        .with_min_inner_size([340.0, 110.0])
+        .with_inner_size(app::initial_window_size(&settings))
+        .with_min_inner_size([240.0, 80.0])
         .with_decorations(false)
         .with_transparent(true)
         .with_drag_and_drop(true)

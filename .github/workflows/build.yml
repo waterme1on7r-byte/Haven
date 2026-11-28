@@ -84,8 +84,10 @@ jobs:
       - name: Declare supported audio types (macOS)
         if: matrix.runner == 'macos-latest'
         run: |
-          # Keep the source ICNS inside the bundle and point LaunchServices at it.
-          cp assets/haven.icns dist/Haven.app/Contents/Resources/haven.icns
+          # Build the icon with Apple's own tool from the iconset (all sizes incl. @2x),
+          # drop any icon the packager generated, and point the bundle at this one.
+          rm -f dist/Haven.app/Contents/Resources/*.icns
+          iconutil -c icns assets/haven.iconset -o dist/Haven.app/Contents/Resources/Haven.icns
           # Without CFBundleDocumentTypes macOS will not list Haven under
           # "Open With" and refuses audio files ("cannot open ... format").
           python3 - <<'PY'
@@ -94,7 +96,8 @@ jobs:
           with open(p, "rb") as f:
               d = plistlib.load(f)
           d["LSMinimumSystemVersion"] = "12.0"
-          d["CFBundleIconFile"] = "haven.icns"
+          d["CFBundleIconFile"] = "Haven"
+          d.pop("CFBundleIconName", None)
           d["CFBundleDocumentTypes"] = [{
               "CFBundleTypeName": "Audio",
               "CFBundleTypeRole": "Viewer",
@@ -122,8 +125,14 @@ jobs:
           codesign --force --deep --sign - dist/Haven.app
           codesign --verify --deep --strict --verbose=2 dist/Haven.app
           file dist/Haven.app/Contents/MacOS/*
-          hdiutil create -volname Haven -srcfolder dist/Haven.app -ov -format UDZO dist/Haven.dmg
-          rm -rf dist/Haven.app
+          # Stage the app next to an Applications shortcut so the disk image offers
+          # the usual drag-to-install layout.
+          rm -rf dist/dmg-staging
+          mkdir dist/dmg-staging
+          cp -R dist/Haven.app dist/dmg-staging/Haven.app
+          ln -s /Applications dist/dmg-staging/Applications
+          hdiutil create -volname Haven -srcfolder dist/dmg-staging -ov -format UDZO dist/Haven.dmg
+          rm -rf dist/dmg-staging dist/Haven.app
       - name: Upload package artifact
         uses: actions/upload-artifact@v4
         with:
