@@ -417,33 +417,73 @@ fn apply_update(dmg: &Path) -> anyhow::Result<()> {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
     const SCRIPT: &str = r#"#!/bin/sh
+# Haven update helper (macOS). Haven is only ad-hoc signed (no Apple Developer ID), so this
+# script makes the new bundle launchable instead of relying on Gatekeeper's blessing:
+#  - clears quarantine/extended attributes from the disk image and the new app,
+#  - re-signs the new app ad hoc so the signature is valid on this Mac,
+#  - swaps it in place (asking for an administrator password only if it must),
+#  - refreshes Launch Services so the icon / registration are current.
 i=0
 while kill -0 "$HAVEN_PID" 2>/dev/null && [ "$i" -lt 60 ]; do sleep 0.5; i=$((i+1)); done
 OK=0
-MNT=$(mktemp -d /tmp/haven-update.XXXXXX)
+WORK=$(mktemp -d /tmp/haven-update.XXXXXX)
+MNT="$WORK/mnt"
+STAGE="$WORK/Haven.app"
+mkdir -p "$MNT"
+xattr -dr com.apple.quarantine "$HAVEN_DMG" >/dev/null 2>&1
 if hdiutil attach "$HAVEN_DMG" -nobrowse -noverify -noautoopen -quiet -mountpoint "$MNT" >/dev/null 2>&1; then
   SRC=$(find "$MNT" -maxdepth 1 -name '*.app' | head -n 1)
   if [ -z "$SRC" ] && [ -d "$MNT/Contents/MacOS" ]; then SRC="$MNT"; fi
-  if [ -n "$SRC" ]; then
-    NEWAPP="$HAVEN_APP.update"
-    OLDAPP="$HAVEN_APP.old"
-    rm -rf "$NEWAPP" "$OLDAPP"
-    if ditto "$SRC" "$NEWAPP" 2>/dev/null; then
-      if mv "$HAVEN_APP" "$OLDAPP" 2>/dev/null; then
-        if mv "$NEWAPP" "$HAVEN_APP" 2>/dev/null; then
-          OK=1
-          rm -rf "$OLDAPP"
-          xattr -cr "$HAVEN_APP" >/dev/null 2>&1
-        else
-          mv "$OLDAPP" "$HAVEN_APP"
-        fi
+  if [ -n "$SRC" ] && ditto "$SRC" "$STAGE" 2>/dev/null &&
+      xattr -cr "$STAGE" >/dev/null 2>&1 &&
+      codesign --force --deep --sign - "$STAGE" >/dev/null 2>&1 &&
+      codesign --verify --deep --strict "$STAGE" >/dev/null 2>&1; then
+    rm -rf "$HAVEN_APP.old"
+    if mv "$HAVEN_APP" "$HAVEN_APP.old" 2>/dev/null; then
+      if ditto "$STAGE" "$HAVEN_APP" 2>/dev/null; then
+        OK=1
+        rm -rf "$HAVEN_APP.old"
+      else
+        rm -rf "$HAVEN_APP"
+        mv "$HAVEN_APP.old" "$HAVEN_APP"
       fi
     fi
-    rm -rf "$NEWAPP"
+    if [ "$OK" != 1 ]; then
+      # Not allowed to modify the folder (e.g. installed by an admin): retry once with a
+      # password prompt. Paths containing a quote are not passed to the shell.
+      case "$HAVEN_APP$STAGE" in
+        *"'"*) ;;
+        *)
+          PS="$WORK/priv.sh"
+          cat > "$PS" <<EOS
+#!/bin/sh
+rm -rf '$HAVEN_APP.old'
+mv '$HAVEN_APP' '$HAVEN_APP.old' || exit 1
+if ditto '$STAGE' '$HAVEN_APP'; then
+  rm -rf '$HAVEN_APP.old'
+  chown -R '$(id -un)' '$HAVEN_APP'
+  xattr -cr '$HAVEN_APP'
+  exit 0
+fi
+rm -rf '$HAVEN_APP'
+mv '$HAVEN_APP.old' '$HAVEN_APP'
+exit 1
+EOS
+          if osascript -e "do shell script \"/bin/sh '$PS'\" with administrator privileges" >/dev/null 2>&1; then
+            OK=1
+          fi
+          ;;
+      esac
+    fi
   fi
   hdiutil detach "$MNT" -quiet -force >/dev/null 2>&1
 fi
-rmdir "$MNT" 2>/dev/null
+if [ "$OK" = 1 ]; then
+  xattr -cr "$HAVEN_APP" >/dev/null 2>&1
+  /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$HAVEN_APP" >/dev/null 2>&1
+  touch "$HAVEN_APP" >/dev/null 2>&1
+fi
+rm -rf "$WORK"
 if [ "$OK" = 1 ]; then
   rm -f "$HAVEN_DMG"
   open "$HAVEN_APP"

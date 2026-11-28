@@ -31,7 +31,7 @@ Installers can be built locally with `cargo install cargo-packager --locked` fol
 The GitHub Actions workflow builds both formats on their native runners and uploads them as
 workflow artifacts. Its macOS DMG contains a Universal 2 app for Intel and Apple silicon, with a
 macOS 12.0 minimum deployment target; this includes macOS Ventura 13. Pushing a version tag such
-as `v0.1.13` also publishes the installers as a GitHub release. macOS packages are ad-hoc signed
+as `v0.1.15` also publishes the installers as a GitHub release. macOS packages are ad-hoc signed
 but not notarized until a Developer ID certificate and notarization are configured.
 On macOS, Haven disables the native window shadow because the transparent player draws its own
 shadow and the system shadow can leave ghosting artifacts during waveform animation. Settings →
@@ -40,7 +40,8 @@ window and Dock icon, and provides playback controls plus Show Haven and Quit Ha
 
 ## macOS notes (hover card, menu bar, icon, DMG)
 - The window keeps a permanent transparent strip below the player for the hover metadata card, so showing or hiding the card (and therefore every click and drag) never resizes or moves the window; resizing a transparent window made the player flash on macOS. The strip is click-through, and the card always appears below the player on macOS.
-- The Menu Bar status item is retained by Haven (AppKit does not keep it alive) and uses the `music.note` SF Symbol, falling back to a ♫ title.
+- Menu Bar size: the status item uses the static `waveform` SF Symbol (text "Haven" before macOS 11) and is retained by Haven (AppKit does not keep it alive). A left click opens the Haven window right under the icon; clicking the icon again or anywhere else closes it. A right click opens a small menu (Play/Pause, Previous, Next, Quit). The window position is not saved in this mode.
+- Updates on macOS: the in-app updater downloads without the quarantine flag and its helper script clears extended attributes, re-signs the new app ad hoc, swaps it in place (with an administrator-password prompt only if the folder is not writable), refreshes Launch Services and relaunches. The DMG also ships `Fix Haven (if macOS blocks it).command` (source: `assets/fix-haven.command`) for a browser-downloaded copy that macOS calls "damaged"; the first run needs right-click → Open. Only an Apple Developer ID + notarization removes the Gatekeeper warning completely.
 - CI builds `Haven.icns` with `iconutil` from `assets/haven.iconset`, removes any icon the packager generated and sets `CFBundleIconFile` to `Haven`.
 - The DMG contains `Haven.app` and an `Applications` shortcut for drag-to-install.
 
@@ -103,10 +104,10 @@ Open the app itself (Haven.app), not the `haven` file inside `Contents/MacOS`. I
 
 ## Updates (GitHub Releases)
 1. `REPO` in `src/update.rs` is `waterme1on7r-byte/Haven`.
-2. Bump `version` in `Cargo.toml` (currently 0.1.13), commit, then push a tag that matches it, e.g. `v0.1.14` for the next release. CI refuses to build a tag that differs from the Cargo version and attaches the Windows installer (.exe) and macOS disk image (.dmg) to the release.
+2. Bump `version` in `Cargo.toml` (currently 0.1.15), commit, then push a tag that matches it, e.g. `v0.1.16` for the next release. CI refuses to build a tag that differs from the Cargo version and attaches the Windows installer (.exe) and macOS disk image (.dmg) to the release.
 3. Running copies check shortly after launch (at most once a day) and via Settings → Updates → Check. When a newer release exists, the Settings icon in the context menu gets a red dot and the Updates row offers **Update**. One click does everything: it downloads the installer (with progress), verifies the size, quits Haven, installs silently and starts the new version.
    - Windows: the NSIS installer is per-user (no administrator prompt) and is run with `/S`. A helper script waits for Haven to exit first, then relaunches Haven.
-   - macOS: the helper copies the new Haven.app out of the disk image over the running bundle and reopens it. If that is not possible (no permission, or not running from an .app) it reopens the old app and shows the disk image so you can drag it over yourself.
+   - macOS: the helper copies the new Haven.app out of the disk image, re-signs it ad hoc, swaps it over the running bundle (prompting for administrator permission only if needed), refreshes Launch Services and reopens it. If installation fails, it reopens the old app and shows the disk image so you can drag it over yourself.
    - If the automatic install cannot start, the installer is opened as before ("Couldn't install by itself — installer opened").
    - Playback stops while Haven restarts; the queue is not restored.
    - Downloads go to a temporary folder and are deleted after a successful install.

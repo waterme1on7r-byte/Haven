@@ -46,6 +46,10 @@ const CARD_HIDE_AFTER: Duration = Duration::from_secs(3);
 /// extra-small player (narrower than the settings rows) can still open them.
 const MIN_PANEL_W: f32 = 378.0;
 
+/// Menu-bar icon click waiting for the UI thread: [icon centre x, menu-bar bottom y,
+/// screen left, screen right] in top-left screen points (written by the IPC thread).
+static POPOVER_REQ: std::sync::Mutex<Option<[f32; 4]>> = std::sync::Mutex::new(None);
+
 /// Window size at launch. On macOS the window permanently includes the strip the
 /// hover card is drawn in (see `Haven::card_reserve`).
 pub fn initial_window_size(settings: &Settings) -> [f32; 2] {
@@ -109,6 +113,12 @@ pub struct Haven {
     panel_unfocused_at: Option<Instant>,
     focused_last_frame: bool,
     allow_clicks: bool,
+    // Menu Bar layout: the window behaves like a popover under the status icon.
+    popover_open: bool,
+    popover_seen_focus: bool,
+    popover_grace: Option<Instant>,
+    popover_hidden_at: Option<Instant>,
+    popover_level_set: bool,
 }
 
 fn scan(paths: &[PathBuf]) -> Vec<PathBuf> {
@@ -161,7 +171,16 @@ fn spawn_ipc(listener: std::net::TcpListener, engine: Engine, ctx: egui::Context
                 .collect();
             let commands: Vec<&str> = buf.lines().map(str::trim).collect();
             if commands.len() == 1 && commands[0].starts_with("@HAVEN:") {
-                match &commands[0][7..] {
+                let mut words = commands[0][7..].split_whitespace();
+                match words.next().unwrap_or("") {
+                    "TOGGLE" => {
+                        let v: Vec<f32> = words.filter_map(|w| w.parse().ok()).collect();
+                        if v.len() >= 4 {
+                            if let Ok(mut req) = POPOVER_REQ.lock() {
+                                *req = Some([v[0], v[1], v[2], v[3]]);
+                            }
+                        }
+                    }
                     "PLAY" => engine.toggle(),
                     "PREV" => engine.prev(),
                     "NEXT" => engine.next(),
@@ -408,6 +427,11 @@ impl Haven {
             panel_unfocused_at: None,
             focused_last_frame: false,
             allow_clicks: false,
+            popover_open: false,
+            popover_seen_focus: false,
+            popover_grace: None,
+            popover_hidden_at: None,
+            popover_level_set: false,
         }
     }
 
@@ -434,7 +458,8 @@ impl Haven {
         {
             self.anchor = Some(pos2(r.min.x, r.min.y + self.top_pad));
             let p = (r.min.x.round(), (r.min.y + self.top_pad).round());
-            if self.settings.pos != Some(p) {
+            // The Menu Bar window is placed under the icon every time; its spot is not saved.
+            if !self.menu_bar_mode() && self.settings.pos != Some(p) {
                 self.settings.pos = Some(p);
                 self.pos_changed = Some(Instant::now());
             }
@@ -447,6 +472,83 @@ impl Haven {
                 ctx.request_repaint_after(Duration::from_millis(550));
             }
         }
+    }
+
+    /// Menu Bar layout: a click on the status icon opens the window right under it,
+    /// another click (or clicking anywhere else) closes it, like a system popover.
+    fn handle_popover(&mut self, ctx: &egui::Context) {
+        if !self.menu_bar_mode() {
+            self.popover_open = false;
+            if self.popover_level_set {
+                self.popover_level_set = false;
+                ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(if self.settings.on_top {
+                    egui::WindowLevel::AlwaysOnTop
+                } else {
+                    egui::WindowLevel::Normal
+                }));
+            }
+            return;
+        }
+        let now = Instant::now();
+        let focused = ctx.input(|i| i.focused);
+        if self.popover_open {
+            if focused {
+                self.popover_seen_focus = true;
+            }
+            let in_grace = self.popover_grace.map_or(false, |t| now < t);
+            if self.popover_seen_focus && !focused && !in_grace {
+                self.hide_popover(ctx);
+            }
+        }
+        let req = POPOVER_REQ.lock().ok().and_then(|mut r| r.take());
+        let Some([cx, bottom, left_edge, right_edge]) = req else {
+            return;
+        };
+        if self.popover_open {
+            self.hide_popover(ctx);
+            return;
+        }
+        // The click that closed the window by taking focus also reaches the icon: ignore it.
+        if self
+            .popover_hidden_at
+            .map_or(false, |t| t.elapsed() < Duration::from_millis(350))
+        {
+            return;
+        }
+        // Visible card is inset 8 pt inside the window (see draw_menu_bar).
+        let w = Settings::dims_for(self.settings.size)[0];
+        let left = (cx - w / 2.0)
+            .min(right_edge - w + 2.0)
+            .max(left_edge - 2.0);
+        let top = bottom - 4.0;
+        let target = pos2(left, top - self.top_pad);
+        self.anchor = Some(pos2(left, top));
+        self.target_outer = Some(target);
+        self.layout_until = Some(now + Duration::from_millis(300));
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(target));
+        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+            egui::WindowLevel::AlwaysOnTop,
+        ));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        self.popover_level_set = true;
+        self.popover_open = true;
+        self.popover_seen_focus = false;
+        self.popover_grace = Some(now + Duration::from_millis(1500));
+        ctx.request_repaint();
+    }
+
+    fn hide_popover(&mut self, ctx: &egui::Context) {
+        self.popover_open = false;
+        self.popover_hidden_at = Some(Instant::now());
+        self.close_menu();
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+    }
+
+    /// File dialogs take focus away from the window; do not treat that as "clicked outside".
+    fn popover_grace_after_dialog(&mut self) {
+        self.popover_grace = Some(Instant::now() + Duration::from_millis(1500));
     }
 
     fn sync_track(&mut self, ctx: &egui::Context) {
@@ -1900,11 +2002,13 @@ impl Haven {
                         {
                             self.open(files, true);
                         }
+                        self.popover_grace_after_dialog();
                     }
                     2 => {
                         if let Some(folder) = rfd::FileDialog::new().pick_folder() {
                             self.open(vec![folder], true);
                         }
+                        self.popover_grace_after_dialog();
                     }
                     _ => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
                 }
@@ -2625,6 +2729,13 @@ impl Haven {
                         ui.ctx()
                             .send_viewport_cmd(egui::ViewportCommand::Visible(false));
                     } else {
+                        // Back to a normal window: return to where it was before Menu Bar.
+                        if let Some((x, y)) = self.settings.pos {
+                            self.anchor = Some(pos2(x, y));
+                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::OuterPosition(
+                                pos2(x, y - self.top_pad),
+                            ));
+                        }
                         ui.ctx()
                             .send_viewport_cmd(egui::ViewportCommand::Visible(true));
                         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -3439,6 +3550,7 @@ impl eframe::App for Haven {
         }
         self.sync_track(ctx);
         self.keys(ctx);
+        self.handle_popover(ctx);
         self.track_position(ctx);
         if self.layout_until.map_or(false, |t| Instant::now() >= t) {
             self.layout_until = None;

@@ -32,11 +32,25 @@ extern "C" {
     fn objc_msgSend();
     fn class_getInstanceMethod(cls: Id, name: Sel) -> *mut c_void;
     fn method_setImplementation(m: *mut c_void, imp: *const c_void) -> *const c_void;
+    // Large struct returns (NSRect) use the _stret entry point on Intel only.
+    #[cfg(target_arch = "x86_64")]
+    fn objc_msgSend_stret();
+}
+
+/// `NSRect` / `CGRect`: origin then size, all doubles.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct NsRect {
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
 }
 
 static ORIG_SET_DELEGATE: AtomicUsize = AtomicUsize::new(0);
 static STATUS_ITEM: AtomicUsize = AtomicUsize::new(0);
 static STATUS_TARGET: AtomicUsize = AtomicUsize::new(0);
+static STATUS_MENU: AtomicUsize = AtomicUsize::new(0);
 static MENU_READY: Once = Once::new();
 static HOOK: Once = Once::new();
 
@@ -86,6 +100,34 @@ unsafe fn msg_void_id(obj: Id, name: &CStr, arg: Id) {
     f(obj, sel(name), arg)
 }
 
+unsafe fn msg_void_sel(obj: Id, name: &CStr, arg: Sel) {
+    let f: unsafe extern "C" fn(Id, Sel, Sel) =
+        std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+    f(obj, sel(name), arg)
+}
+
+unsafe fn msg_void_usize(obj: Id, name: &CStr, arg: usize) {
+    let f: unsafe extern "C" fn(Id, Sel, usize) =
+        std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+    f(obj, sel(name), arg)
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn msg_rect(obj: Id, name: &CStr) -> NsRect {
+    let f: unsafe extern "C" fn(Id, Sel) -> NsRect =
+        std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+    f(obj, sel(name))
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn msg_rect(obj: Id, name: &CStr) -> NsRect {
+    let f: unsafe extern "C" fn(*mut NsRect, Id, Sel) =
+        std::mem::transmute(objc_msgSend_stret as unsafe extern "C" fn());
+    let mut out = NsRect::default();
+    f(&mut out, obj, sel(name));
+    out
+}
+
 unsafe fn msg_id_id_id(obj: Id, name: &CStr, a: Id, b: Id) -> Id {
     let f: unsafe extern "C" fn(Id, Sel, Id, Id) -> Id =
         std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
@@ -112,7 +154,7 @@ unsafe fn status_symbol() -> Id {
     msg_id_id_id(
         cls,
         c"imageWithSystemSymbolName:accessibilityDescription:",
-        ns_string("music.note"),
+        ns_string("waveform"), // static sound-wave glyph, adapts to light/dark menu bars
         ns_string("Haven"),
     )
 }
@@ -153,6 +195,67 @@ extern "C" fn status_quit(_this: Id, _cmd: Sel, _sender: Id) {
     unsafe { status_command("QUIT") }
 }
 
+/// Click on the menu-bar icon: tell Haven to show/hide its window under the icon.
+/// A right click opens a small menu instead (play/pause, previous, next, quit).
+extern "C" fn status_toggle(_this: Id, _cmd: Sel, _sender: Id) {
+    unsafe {
+        let item = STATUS_ITEM.load(Ordering::SeqCst) as Id;
+        if item.is_null() {
+            return;
+        }
+        let app = msg_id(objc_getClass(c"NSApplication".as_ptr()), c"sharedApplication");
+        let event = if app.is_null() {
+            std::ptr::null_mut()
+        } else {
+            msg_id(app, c"currentEvent")
+        };
+        // NSEventTypeRightMouseUp = 4
+        let right = !event.is_null() && msg_usize(event, c"type") == 4;
+        let button = msg_id(item, c"button");
+        if right {
+            let menu = STATUS_MENU.load(Ordering::SeqCst) as Id;
+            if !menu.is_null() && !button.is_null() {
+                msg_void_id(item, c"popUpStatusItemMenu:", menu);
+            }
+            return;
+        }
+        let window = if button.is_null() {
+            std::ptr::null_mut()
+        } else {
+            msg_id(button, c"window")
+        };
+        if window.is_null() {
+            return;
+        }
+        // Screen coordinates are bottom-left based; Haven (winit) uses top-left.
+        let icon = msg_rect(window, c"frame");
+        let screens = msg_id(objc_getClass(c"NSScreen".as_ptr()), c"screens");
+        let primary = if screens.is_null() {
+            std::ptr::null_mut()
+        } else {
+            msg_id_usize(screens, c"objectAtIndex:", 0)
+        };
+        let primary_frame = if primary.is_null() {
+            icon
+        } else {
+            msg_rect(primary, c"frame")
+        };
+        let screen = msg_id(window, c"screen");
+        let screen_frame = if screen.is_null() {
+            primary_frame
+        } else {
+            msg_rect(screen, c"frame")
+        };
+        let cx = icon.x + icon.w / 2.0;
+        let bottom = primary_frame.y + primary_frame.h - icon.y;
+        status_command(&format!(
+            "TOGGLE {cx:.1} {bottom:.1} {:.1} {:.1}",
+            screen_frame.x,
+            screen_frame.x + screen_frame.w
+        ));
+    }
+}
+
 unsafe fn status_target() -> Id {
     MENU_READY.call_once(|| unsafe {
         let superclass = objc_getClass(c"NSObject".as_ptr());
@@ -161,6 +264,7 @@ unsafe fn status_target() -> Id {
             return;
         }
         for (selector, callback) in [
+            (c"togglePopover:", status_toggle as *const c_void),
             (c"play:", status_play as *const c_void),
             (c"previous:", status_prev as *const c_void),
             (c"next:", status_next as *const c_void),
@@ -227,8 +331,8 @@ unsafe fn create_status_item() -> bool {
     if !button.is_null() {
         let image = status_symbol();
         if image.is_null() {
-            // No SF Symbols: fall back to a text glyph so the item is always visible.
-            msg_void_id(button, c"setTitle:", ns_string("♫"));
+            // No SF Symbols (macOS < 11): fall back to a text label so the item is visible.
+            msg_void_id(button, c"setTitle:", ns_string("Haven"));
         } else {
             msg_void_id(button, c"setImage:", image);
         }
@@ -241,9 +345,8 @@ unsafe fn create_status_item() -> bool {
         STATUS_ITEM.store(0, Ordering::SeqCst);
         return false;
     }
-    let menu = msg_id(objc_getClass(c"NSMenu".as_ptr()), c"new");
     let target = status_target();
-    if menu.is_null() || target.is_null() {
+    if target.is_null() {
         let remove: unsafe extern "C" fn(Id, Sel, Id) =
             std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
         remove(bar, sel(c"removeStatusItem:"), item);
@@ -251,16 +354,26 @@ unsafe fn create_status_item() -> bool {
         STATUS_ITEM.store(0, Ordering::SeqCst);
         return false;
     }
-    make_status_menu_item(menu, target, "Play / Pause", c"play:");
-    make_status_menu_item(menu, target, "Previous", c"previous:");
-    make_status_menu_item(menu, target, "Next", c"next:");
-    let separator = msg_id(objc_getClass(c"NSMenuItem".as_ptr()), c"separatorItem");
-    let add: unsafe extern "C" fn(Id, Sel, Id) =
-        std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
-    add(menu, sel(c"addItem:"), separator);
-    make_status_menu_item(menu, target, "Show Haven…", c"showHaven:");
-    make_status_menu_item(menu, target, "Quit Haven", c"quitHaven:");
-    msg_void_id(item, c"setMenu:", menu);
+    // Left click toggles Haven's window under the icon, right click shows a menu.
+    msg_void_id(button, c"setTarget:", target);
+    msg_void_sel(button, c"setAction:", sel(c"togglePopover:"));
+    // NSEventMaskLeftMouseUp (1 << 2) | NSEventMaskRightMouseUp (1 << 4)
+    msg_void_usize(button, c"sendActionOn:", (1 << 2) | (1 << 4));
+
+    if (STATUS_MENU.load(Ordering::SeqCst) as Id).is_null() {
+        let menu = msg_id(objc_getClass(c"NSMenu".as_ptr()), c"new");
+        if !menu.is_null() {
+            make_status_menu_item(menu, target, "Play / Pause", c"play:");
+            make_status_menu_item(menu, target, "Previous", c"previous:");
+            make_status_menu_item(menu, target, "Next", c"next:");
+            let separator = msg_id(objc_getClass(c"NSMenuItem".as_ptr()), c"separatorItem");
+            let add: unsafe extern "C" fn(Id, Sel, Id) =
+                std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+            add(menu, sel(c"addItem:"), separator);
+            make_status_menu_item(menu, target, "Quit Haven", c"quitHaven:");
+            STATUS_MENU.store(menu as usize, Ordering::SeqCst);
+        }
+    }
     true
 }
 
