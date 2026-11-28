@@ -86,6 +86,37 @@ unsafe fn msg_void_id(obj: Id, name: &CStr, arg: Id) {
     f(obj, sel(name), arg)
 }
 
+unsafe fn msg_id_id_id(obj: Id, name: &CStr, a: Id, b: Id) -> Id {
+    let f: unsafe extern "C" fn(Id, Sel, Id, Id) -> Id =
+        std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+    f(obj, sel(name), a, b)
+}
+
+/// SF Symbol image for the status item (macOS 11+); null when unavailable.
+unsafe fn status_symbol() -> Id {
+    let cls = objc_getClass(c"NSImage".as_ptr());
+    if cls.is_null() {
+        return std::ptr::null_mut();
+    }
+    // Older systems do not have the selector; messaging it would crash.
+    let responds: unsafe extern "C" fn(Id, Sel, Sel) -> i8 =
+        std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+    if responds(
+        cls,
+        sel(c"respondsToSelector:"),
+        sel(c"imageWithSystemSymbolName:accessibilityDescription:"),
+    ) == 0
+    {
+        return std::ptr::null_mut();
+    }
+    msg_id_id_id(
+        cls,
+        c"imageWithSystemSymbolName:accessibilityDescription:",
+        ns_string("music.note"),
+        ns_string("Haven"),
+    )
+}
+
 unsafe fn ns_string(text: &str) -> Id {
     let Ok(text) = std::ffi::CString::new(text) else {
         return std::ptr::null_mut();
@@ -187,16 +218,26 @@ unsafe fn create_status_item() -> bool {
     if item.is_null() {
         return false;
     }
+    // The status bar does not keep its items alive and `statusItemWithLength:` returns
+    // an autoreleased object: without this retain the item is freed when the current
+    // autorelease pool drains and the icon vanishes right after it appears.
+    msg_id(item, c"retain");
     STATUS_ITEM.store(item as usize, Ordering::SeqCst);
     let button = msg_id(item, c"button");
     if !button.is_null() {
-        // Keep a visible glyph even if SF Symbols lookup/rendering differs by OS.
-        msg_void_id(button, c"setTitle:", ns_string("♫"));
+        let image = status_symbol();
+        if image.is_null() {
+            // No SF Symbols: fall back to a text glyph so the item is always visible.
+            msg_void_id(button, c"setTitle:", ns_string("♫"));
+        } else {
+            msg_void_id(button, c"setImage:", image);
+        }
         msg_void_id(button, c"setToolTip:", ns_string("Haven"));
     } else {
         let remove: unsafe extern "C" fn(Id, Sel, Id) =
             std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
         remove(bar, sel(c"removeStatusItem:"), item);
+        msg_id(item, c"release");
         STATUS_ITEM.store(0, Ordering::SeqCst);
         return false;
     }
@@ -206,6 +247,7 @@ unsafe fn create_status_item() -> bool {
         let remove: unsafe extern "C" fn(Id, Sel, Id) =
             std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
         remove(bar, sel(c"removeStatusItem:"), item);
+        msg_id(item, c"release");
         STATUS_ITEM.store(0, Ordering::SeqCst);
         return false;
     }
@@ -244,6 +286,7 @@ pub fn set_menu_bar_mode(enabled: bool) -> bool {
             if !item.is_null() {
                 let bar = msg_id(objc_getClass(c"NSStatusBar".as_ptr()), c"systemStatusBar");
                 msg_void_id(bar, c"removeStatusItem:", item);
+                msg_id(item, c"release"); // balances the retain in create_status_item
             }
         }
         true

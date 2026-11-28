@@ -7,7 +7,8 @@ pub struct Settings {
     pub locked: bool,
     /// Window outer position in points (x, y).
     pub pos: Option<(f32, f32)>,
-    /// 0 = small, 1 = medium, 2 = big, 3 = macOS Menu Bar layout.
+    /// 0 = small, 1 = medium, 2 = big, 3 = macOS Menu Bar layout, 4 = extra small.
+    /// (4 was added later, so the numbers saved by older versions keep their meaning.)
     pub size: u8,
     /// Waveform style 0..=4.
     pub wave: u8,
@@ -54,6 +55,7 @@ impl Settings {
     }
     pub fn dims_for(n: u8) -> [f32; 2] {
         match n {
+            4 => [284.0, 95.0],
             0 => [378.0, 126.0],
             1 => [504.0, 168.0],
             #[cfg(target_os = "macos")]
@@ -98,7 +100,11 @@ impl Settings {
                         }
                         if let Some(v) = l.strip_prefix("size=") {
                             if let Ok(n) = v.parse::<u8>() {
-                                s.size = n.min(if cfg!(target_os = "macos") { 3 } else { 2 });
+                                s.size = match n {
+                                    0 | 1 | 2 | 4 => n,
+                                    3 if cfg!(target_os = "macos") => 3,
+                                    _ => s.size,
+                                };
                             }
                         }
                     }
